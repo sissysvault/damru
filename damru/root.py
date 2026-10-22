@@ -345,37 +345,32 @@ _FONTS_XML_ORIG = "/data/local/tmp/damru_fonts_orig.xml"
 _FONT_MARKER = "/data/local/tmp/damru_fonts_installed"
 
 # Extra fonts to install for font fingerprint diversity.
+# Stealth100: 22 fonts (was 9) — pushes CreepJS/Sannysoft font count to 30+.
 # Each: (css_family_name, ttf_filename, download_urls, [creepjs_alias_names])
-# Aliases map common fingerprinting test names to distinct typefaces,
-# increasing the font detection count from 7 to ~15.
 _EXTRA_FONTS: list[tuple[str, str, list[str], list[str]]] = [
-    ("open-sans", "OpenSans-Regular.ttf", [
-        "https://raw.githubusercontent.com/googlefonts/opensans/main/fonts/ttf/OpenSans-Regular.ttf",
-    ], ["Open Sans", "Segoe UI"]),
-    ("lato", "Lato-Regular.ttf", [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/lato/Lato-Regular.ttf",
-    ], ["Trebuchet MS"]),
-    ("montserrat", "Montserrat-Regular.ttf", [
-        "https://raw.githubusercontent.com/JulietaUla/Montserrat/master/fonts/ttf/Montserrat-Regular.ttf",
-    ], ["Century Gothic"]),
-    ("oswald", "Oswald-Regular.ttf", [
-        "https://raw.githubusercontent.com/googlefonts/OswaldFont/main/fonts/ttf/Oswald-Regular.ttf",
-    ], ["Impact"]),
-    ("fira-mono", "FiraMono-Regular.ttf", [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/firamono/FiraMono-Regular.ttf",
-    ], ["Fira Mono", "Consolas", "Lucida Console"]),
-    ("merriweather", "Merriweather-Regular.ttf", [
-        "https://raw.githubusercontent.com/SorkinType/Merriweather/master/fonts/ttf/Merriweather-Regular.ttf",
-    ], ["Cambria"]),
-    ("pt-sans", "PTSans-Regular.ttf", [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/ptsans/PT_Sans-Web-Regular.ttf",
-    ], ["PT Sans", "Calibri", "Book Antiqua"]),
-    ("poppins", "Poppins-Regular.ttf", [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf",
-    ], ["Century Schoolbook"]),
-    ("inconsolata", "Inconsolata-Regular.ttf", [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/inconsolata/static/Inconsolata-Regular.ttf",
-    ], ["Lucida Sans Typewriter"]),
+    ("open-sans", "OpenSans-Regular.ttf", ["https://raw.githubusercontent.com/googlefonts/opensans/main/fonts/ttf/OpenSans-Regular.ttf"], ["Open Sans", "Segoe UI"]),
+    ("lato", "Lato-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/lato/Lato-Regular.ttf"], ["Trebuchet MS"]),
+    ("montserrat", "Montserrat-Regular.ttf", ["https://raw.githubusercontent.com/JulietaUla/Montserrat/master/fonts/ttf/Montserrat-Regular.ttf"], ["Century Gothic"]),
+    ("oswald", "Oswald-Regular.ttf", ["https://raw.githubusercontent.com/googlefonts/OswaldFont/main/fonts/ttf/Oswald-Regular.ttf"], ["Impact"]),
+    ("fira-mono", "FiraMono-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/firamono/FiraMono-Regular.ttf"], ["Fira Mono", "Consolas", "Lucida Console"]),
+    ("merriweather", "Merriweather-Regular.ttf", ["https://raw.githubusercontent.com/SorkinType/Merriweather/master/fonts/ttf/Merriweather-Regular.ttf"], ["Cambria"]),
+    ("pt-sans", "PTSans-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/ptsans/PT_Sans-Web-Regular.ttf"], ["PT Sans", "Calibri", "Book Antiqua"]),
+    ("poppins", "Poppins-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf"], ["Century Schoolbook"]),
+    ("inconsolata", "Inconsolata-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/inconsolata/static/Inconsolata-Regular.ttf"], ["Lucida Sans Typewriter"]),
+    # ── Stealth100 additions ──
+    ("roboto", "Roboto-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf"], ["Roboto", "Helvetica Neue"]),
+    ("inter", "Inter-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter-Regular.ttf"], ["Inter", "SF Pro Display"]),
+    ("nunito", "Nunito-Regular.ttf", ["https://raw.githubusercontent.com/googlefonts/nunito/main/fonts/ttf/Nunito-Regular.ttf"], ["Nunito", "Arial Rounded"]),
+    ("raleway", "Raleway-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/raleway/Raleway-Regular.ttf"], ["Raleway", "Gotham"]),
+    ("ubuntu", "Ubuntu-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/ubuntu/Ubuntu-Regular.ttf"], ["Ubuntu", "Tahoma"]),
+    ("playfair", "PlayfairDisplay-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay-Regular.ttf"], ["Playfair Display", "Times New Roman"]),
+    ("source-sans", "SourceSans3-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/sourcesans3/SourceSans3-Regular.ttf"], ["Source Sans 3", "Franklin Gothic"]),
+    ("noto-serif", "NotoSerif-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/notoserif/NotoSerif-Regular.ttf"], ["Noto Serif", "Georgia"]),
+    ("jetbrains-mono", "JetBrainsMono-Regular.ttf", ["https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/ttf/JetBrainsMono-Regular.ttf"], ["JetBrains Mono", "Courier New"]),
+    ("rubik", "Rubik-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/rubik/Rubik-Regular.ttf"], ["Rubik", "Verdana"]),
+    ("work-sans", "WorkSans-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/worksans/WorkSans-Regular.ttf"], ["Work Sans", "Gill Sans"]),
+    ("dm-sans", "DMSans-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/dmsans/DMSans-Regular.ttf"], ["DM Sans", "Avenir"]),
+    ("lexend", "Lexend-Regular.ttf", ["https://raw.githubusercontent.com/google/fonts/main/ofl/lexend/Lexend-Regular.ttf"], ["Lexend", "Myriad Pro"]),
 ]
 
 

@@ -967,6 +967,8 @@ class AsyncDamru:
                 android_version=target_device.android_version,
             ),
         )
+        # Stealth100: canvas/audio per-session noise (single minimal JS, native-mimicking)
+        await self._apply_canvas_noise(target_device)
         if os.environ.get("DAMRU_EXPERIMENTAL_CDP_SENSORS", "1") == "1":
             await self._apply_sensor_emulation()
 
@@ -1575,8 +1577,9 @@ class AsyncDamru:
         if not self._context:
             return
 
-        # Keep quota in common real-phone range close to Samsung reference.
-        quota_gb = 64
+        # Stealth100: jitter per device storage tier (32-256GB → 8-64GB quota)
+        # Lower tiers (budget phones) → 32GB storage → ~10GB quota plausible
+        quota_gb = random.choice([16, 32, 32, 64, 64, 64])  # weighted to 32/64
         quota_bytes = quota_gb * 1024 * 1024 * 1024
         self._sync_storage_quota_bytes = quota_bytes
 
@@ -2044,11 +2047,16 @@ class AsyncDamru:
         if not self._context:
             return
 
-        # Match the real Samsung reference profile captured for this project.
-        conn_type = "wifi"
-        latency_ms = 200
-        download_bps = 1_700_000   # ~1.7 Mbps
-        upload_bps = 1_000_000     # ~1 Mbps
+        # Stealth100: jitter per session to break timing fingerprint clustering
+        conn_type = random.choice(["wifi", "wifi", "cellular"])  # 66% wifi, 33% cellular
+        if conn_type == "cellular":
+            latency_ms = random.randint(80, 180)
+            download_bps = random.randint(900_000, 3_000_000)
+            upload_bps = random.randint(500_000, 1_500_000)
+        else:
+            latency_ms = random.randint(30, 90)
+            download_bps = random.randint(5_000_000, 25_000_000)
+            upload_bps = random.randint(2_000_000, 10_000_000)
 
         net_params = {
             "offline": False,
@@ -2205,6 +2213,27 @@ class AsyncDamru:
 
         self._context.on("page", _on_page)
         logger.info("Worker cores override armed: %d (CDP target auto-attach)", target_cores)
+
+    async def _apply_canvas_noise(self, device) -> None:
+        """Per-session Canvas/Audio/WebGL noise via CDP preload (stealth100)."""
+        if not self._context:
+            return
+        try:
+            from .canvas_noise import canvas_noise_js, should_inject
+            if not should_inject():
+                return
+            seed = f"{device.model}|{self._profile.timezone}|{self._profile.locale}|{self._sensor_seed}"
+            js = canvas_noise_js(seed)
+            await self._context.add_init_script(js)
+            # Also apply to existing pages
+            for p in self._context.pages:
+                try:
+                    await p.evaluate(js)
+                except Exception:
+                    pass
+            logger.info("Canvas/Audio noise injected (seed %s...)", seed[:8])
+        except Exception as e:
+            logger.debug("Canvas noise inject failed: %s", e)
 
     async def _verify_worker_cores(self, target_cores: int, retries: int = 5) -> None:
         """Verify worker hardwareConcurrency and retry arming if needed.

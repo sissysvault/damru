@@ -40,10 +40,10 @@ try:
 except ImportError:
     cffi_requests = None
 
+# Stealth100: Chrome-only mobile profiles + weighted pool for Android UA consistency
 _BROWSER_PROFILES = [
-    "chrome120", "chrome124", "chrome131",
-    "safari17_0", "safari18_0",
-    "edge101",
+    "chrome120", "chrome124", "chrome131", "chrome133", "chrome136",
+    "chrome131_android",  # mobile-specific when available
 ]
 
 
