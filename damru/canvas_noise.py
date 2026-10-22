@@ -31,6 +31,23 @@ def canvas_noise_js(seed: str) -> str:
 
     return f"""
 (() => {{
+  // ── Automation tell removal (true deletion so `'webdriver' in navigator === false`) ──
+  try {{ delete Navigator.prototype.webdriver; }} catch(e) {{}}
+  try {{ delete navigator.webdriver; }} catch(e) {{}}
+  // Do NOT re-create `navigator.webdriver` — leaving it absent makes
+  // `'webdriver' in navigator === false` which is the real-device signal.
+  try {{ if (!window.chrome) {{ window.chrome = {{ runtime: {{}}, loadTimes: function(){{}}, csi: function(){{}} }}; }} }} catch(e) {{}}
+  try {{ if (!window.chrome.runtime) window.chrome.runtime = {{}}; }} catch(e) {{}}
+  // Permissions prompt spoof (headless shows 'denied', real Android shows 'prompt')
+  try {{
+    const _origQuery = navigator.permissions && navigator.permissions.query;
+    if (_origQuery) {{
+      navigator.permissions.query = function(p) {{
+        if (p && p.name === 'notifications') return Promise.resolve({{ state: 'prompt', onchange: null }});
+        return _origQuery.call(this, p);
+      }};
+    }}
+  }} catch(e) {{}}
   const _r={r:.6f}, _g={g:.6f}, _b={b:.6f}, _aj={audio_jitter:.7f};
   // Canvas 2D noise — sub-pixel getImageData perturbation
   try {{
