@@ -324,6 +324,7 @@ _DEVICE_RESETPROP = "/data/local/tmp/resetprop"
 # Memory spoof paths on device
 _FAKEMEM_SO = "/data/local/tmp/libfakemem.so"
 _FAKEMEM_TARGET = "/data/local/tmp/damru_fakemem_gb"
+_FAKEMEM_CPUS = "/data/local/tmp/damru_fakemem_cpus"
 _FAKEMEM_WRAP = "/data/local/tmp/damru_chrome_wrap.sh"
 _APP_PROCESS_REAL = "/system/bin/app_process64.real"
 _WEBVIEW_SYSTEM_LIB = "/system/product/app/webview/lib/x86_64/libmonochrome_64.so"
@@ -1291,12 +1292,18 @@ echo damru_app_data_dirs_created=$created
         except (ValueError, IndexError):
             real_cores = 0
 
+        # Stealth100: do NOT cap to the host core count. libfakemem.so intercepts
+        # sysconf(_SC_NPROCESSORS_ONLN) and sched_getaffinity, so the spoofed count
+        # is genuine at libc level for the main thread and every worker thread.
+        # This removes the main/worker mismatch and the need for CDP worker attach.
         if real_cores > 0 and target_cores > real_cores:
-            logger.warning(
-                "Target cores (%d) > real cores (%d) - capping to %d",
-                target_cores, real_cores, real_cores,
+            logger.info(
+                "Spoofing cores upward: real=%d -> target=%d (native libfakemem interposition)",
+                real_cores, target_cores,
             )
-            target_cores = real_cores
+        await self.adb.shell_root(
+            f"printf '%s\\n' {target_cores} > {_FAKEMEM_CPUS}; chmod 0644 {_FAKEMEM_CPUS}"
+        )
 
         cpu_range = "0" if target_cores == 1 else f"0-{target_cores - 1}"
         await self.adb.shell_root(
@@ -1309,8 +1316,11 @@ echo damru_app_data_dirs_created=$created
         await self.adb.shell_root(
             "out=/data/local/tmp/proc_stat_spoof; "
             "head -n 1 /proc/stat > \"$out\"; "
+            "base=\"$(grep '^cpu0 ' /proc/stat)\" ; "
             f"i=0; while [ $i -lt {target_cores} ]; do "
-            "grep \"^cpu${i} \" /proc/stat >> \"$out\"; "
+            "line=\"$(grep \"^cpu${i} \" /proc/stat)\" ; "
+            "if [ -n \"$line\" ]; then printf '%s\\n' \"$line\" >> \"$out\" ; "
+            "else printf '%s\\n' \"$base\" | sed \"s/^cpu0 /cpu${i} /\" >> \"$out\" ; fi ; "
             "i=$((i+1)); "
             "done; "
             "grep -v '^cpu' /proc/stat >> \"$out\"",
@@ -2618,7 +2628,20 @@ echo damru_app_data_dirs_created=$created
         system processes and can destabilize ADB/Android after a live restart.
         """
         await self._restore_global_memory_preload_if_needed()
-        wrap_targets = tuple(dict.fromkeys((chrome_package, *extra_packages)))
+        base_targets = tuple(dict.fromkeys((chrome_package, *extra_packages)))
+        # Child process names: Chrome forks renderers from its privileged zygote
+        # (":privileged_process0") and sandboxed children (":sandboxed_processN").
+        # Setting wrap only for the browser process leaves renderers without
+        # LD_PRELOAD, so native CPU/RAM spoofing never reaches them. Wrap the
+        # child names too so sysconf/sched_getaffinity interposition applies to
+        # every renderer thread (main + workers) with zero CDP surface.
+        child_targets = []
+        for base in base_targets:
+            for suffix in (":privileged_process0", ":privileged_process1", ":privileged_process2"):
+                child_targets.append(f"{base}{suffix}")
+            for n in range(0, 8):
+                child_targets.append(f"{base}:sandboxed_process{n}")
+        wrap_targets = tuple(dict.fromkeys((*base_targets, *child_targets)))
         for target in wrap_targets:
             if not re.fullmatch(r"[A-Za-z0-9_.:-]+", target):
                 raise RootError(f"Unsafe wrap target for memory preload: {target!r}")
@@ -2649,7 +2672,7 @@ echo damru_app_data_dirs_created=$created
                 "am force-stop com.android.webview 2>/dev/null || true; "
                 "killall webview_zygote 2>/dev/null || true"
             )
-        logger.info("Memory preload active for %s via Android wrap property", ", ".join(wrap_targets))
+        logger.info("Memory preload active for %s via Android wrap property (browser + renderer child names)", ", ".join(base_targets))
 
     async def setup_native_proc_preload(
         self,
@@ -2684,7 +2707,14 @@ echo damru_app_data_dirs_created=$created
         extra_packages: tuple[str, ...] = (),
     ) -> None:
         """Restore original app_process64 (best-effort cleanup)."""
-        for target in tuple(dict.fromkeys((chrome_package, *extra_packages))):
+        base_targets = tuple(dict.fromkeys((chrome_package, *extra_packages)))
+        targets = list(base_targets)
+        for base in base_targets:
+            for suffix in (":privileged_process0", ":privileged_process1", ":privileged_process2"):
+                targets.append(f"{base}{suffix}")
+            for n in range(0, 8):
+                targets.append(f"{base}:sandboxed_process{n}")
+        for target in tuple(dict.fromkeys(targets)):
             await self.adb.shell_root(f"setprop wrap.{target} ''")
         await self._restore_global_memory_preload_if_needed()
 

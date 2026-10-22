@@ -3,6 +3,7 @@ LIBC {
         sysconf;
         __sysconf;
         sysinfo;
+        sched_getaffinity;
         get_phys_pages;
         __get_phys_pages;
         get_avphys_pages;

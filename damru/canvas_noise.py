@@ -48,6 +48,62 @@ def canvas_noise_js(seed: str) -> str:
       }};
     }}
   }} catch(e) {{}}
+  // ── PluginArray shim (Android Chrome exposes 0 plugins; desktop tests flag that) ──
+  // Builds real Plugin/MimeType instances so instanceof + toString stay native-looking.
+  try {{
+    if (navigator.plugins.length === 0 && window.PluginArray && window.Plugin) {{
+      const _pd = [
+        ['PDF Viewer', 'internal-pdf-viewer'],
+        ['Chrome PDF Viewer', 'internal-pdf-viewer'],
+        ['Chromium PDF Viewer', 'internal-pdf-viewer'],
+        ['Microsoft Edge PDF Viewer', 'internal-pdf-viewer'],
+        ['WebKit built-in PDF', 'internal-pdf-viewer'],
+      ];
+      const _mimeData = ['application/pdf', 'text/pdf'];
+      const _plugins = [];
+      const _mimes = [];
+      for (const [nm, fn] of _pd) {{
+        const pl = Object.create(Plugin.prototype);
+        Object.defineProperties(pl, {{
+          name: {{ value: nm, enumerable: true }},
+          filename: {{ value: fn, enumerable: true }},
+          description: {{ value: 'Portable Document Format', enumerable: true }},
+          length: {{ value: _mimeData.length, enumerable: false }},
+        }});
+        _mimeData.forEach((mt, i) => {{
+          const m = Object.create(MimeType.prototype);
+          Object.defineProperties(m, {{
+            type: {{ value: mt, enumerable: true }},
+            suffixes: {{ value: 'pdf', enumerable: true }},
+            description: {{ value: 'Portable Document Format', enumerable: true }},
+            enabledPlugin: {{ value: pl, enumerable: false }},
+          }});
+          Object.defineProperty(pl, i, {{ value: m, enumerable: true }});
+          _mimes.push(m);
+        }});
+        Object.defineProperty(pl, 'item', {{ value: (i) => pl[i] || null, enumerable: false }});
+        Object.defineProperty(pl, 'namedItem', {{ value: (n) => (n === mt || n === 'application/pdf') ? pl[0] : null, enumerable: false }});
+        _plugins.push(pl);
+      }}
+      const _pa = Object.create(PluginArray.prototype);
+      _plugins.forEach((p, i) => Object.defineProperty(_pa, i, {{ value: p, enumerable: true }}));
+      Object.defineProperties(_pa, {{
+        length: {{ value: _plugins.length, enumerable: false }},
+        item: {{ value: (i) => _plugins[i] || null, enumerable: false }},
+        namedItem: {{ value: (n) => _plugins.find(p => p.name === n) || null, enumerable: false }},
+      }});
+      Object.defineProperty(Navigator.prototype, 'plugins', {{ get: () => _pa, configurable: true }});
+      // mimeTypes must stay consistent with plugins
+      const _ma = Object.create(MimeTypeArray.prototype);
+      _mimes.forEach((m, i) => Object.defineProperty(_ma, i, {{ value: m, enumerable: true }}));
+      Object.defineProperties(_ma, {{
+        length: {{ value: _mimes.length, enumerable: false }},
+        item: {{ value: (i) => _mimes[i] || null, enumerable: false }},
+        namedItem: {{ value: (n) => _mimes.find(m => m.type === n) || null, enumerable: false }},
+      }});
+      Object.defineProperty(Navigator.prototype, 'mimeTypes', {{ get: () => _ma, configurable: true }});
+    }}
+  }} catch(e) {{}}
   const _r={r:.6f}, _g={g:.6f}, _b={b:.6f}, _aj={audio_jitter:.7f};
   // Canvas 2D noise — sub-pixel getImageData perturbation
   try {{

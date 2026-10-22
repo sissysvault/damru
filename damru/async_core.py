@@ -974,16 +974,24 @@ class AsyncDamru:
 
         # Browser-level worker auto-attach is experimental on Android Chrome;
         # page-level hardware override above is stable and keeps CDP alive.
-        if os.environ.get("DAMRU_EXPERIMENTAL_WORKER_CORE_CDP", "1") == "1":
-            await self._arm_worker_core_override(target_device.hardware_concurrency)
-            await self._verify_worker_cores(target_device.hardware_concurrency)
+        # Stealth100: only arm worker CDP when the main page was actually
+        # overridden. If cores were clamped to the real count, main and worker
+        # already agree, so attaching CDP to workers only creates a detection
+        # surface (isAutomatedWithCDPInWebWorker).
+        eff_cores = getattr(self, "_effective_cores", target_device.hardware_concurrency)
+        needs_worker_arm = eff_cores != getattr(self, "_real_cores", eff_cores)
+        if os.environ.get("DAMRU_EXPERIMENTAL_WORKER_CORE_CDP", "1") == "1" and (
+            needs_worker_arm or os.environ.get("DAMRU_FORCE_WORKER_CDP") == "1"
+        ):
+            await self._arm_worker_core_override(eff_cores)
+            await self._verify_worker_cores(eff_cores)
         # Keep Android Chrome's initial tab alive. Creating/navigating a fresh
         # tab via Playwright CDP can close the mobile target on some builds.
         await self._apply_timezone_override()
         self._wrap_context_new_page()
 
         # Expose override targets for DamruPoolSync reattach
-        self._override_cores = target_device.hardware_concurrency
+        self._override_cores = getattr(self, "_effective_cores", target_device.hardware_concurrency)
         self._override_memory = target_device.device_memory
         self._cdp_port = self._cdp._local_port
 
@@ -1457,11 +1465,25 @@ class AsyncDamru:
         )
         actual_cores = actual.get("cores", 0)
         actual_mem = actual.get("mem")
+        self._real_cores = actual_cores
 
         logger.info(
             "Hardware: emulator cores=%s mem=%s, target cores=%s mem=%s",
             actual_cores, actual_mem, target_cores, device.device_memory,
         )
+
+        # Stealth100: keep the spoofed target (e.g. 9). The native libfakemem
+        # interposition makes sysconf/sched_getaffinity return it for the main
+        # thread and all workers, so `actual_cores` should already equal the
+        # target when the native layer is active. Only if the native layer
+        # failed (actual < target) do we fall back to a CDP override.
+        self._effective_cores = target_cores
+        if actual_cores and target_cores > actual_cores:
+            logger.warning(
+                "Cores: native spoof inactive (page reports %d, target %d); "
+                "falling back to CDP override + worker attach",
+                actual_cores, target_cores,
+            )
 
         # --- CDP override for hardwareConcurrency (C++ level) ---
         needs_cores_override = actual_cores != target_cores

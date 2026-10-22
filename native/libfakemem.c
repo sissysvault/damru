@@ -105,9 +105,42 @@ static inline long _open_ro(const char *path) {
 /* ── Target file and cache ── */
 
 static const char _path[] = "/data/local/tmp/damru_fakemem_gb";
+static const char _cpus_path[] = "/data/local/tmp/damru_fakemem_cpus";
 static const char _mountinfo_path[] = "/data/local/tmp/damru_proc_mountinfo";
 static unsigned long _target_bytes = 0;
+static int _target_cpus = 0;
 static int _done = 0;
+static int _cpus_done = 0;
+
+/* Read the target CPU count. Chrome derives navigator.hardwareConcurrency from
+ * sched_getaffinity/sysconf(_SC_NPROCESSORS_ONLN). Lying here makes the value
+ * genuine at the libc level for the main thread AND every worker thread, so no
+ * CDP worker auto-attach (a detectable surface) is required. */
+static void _load_cpus(void) {
+    long fd, n, i;
+    char buf[8];
+    int value;
+
+    if (_cpus_done) return;
+    _cpus_done = 1;
+
+    fd = _open_ro(_cpus_path);
+    if (fd < 0) return;
+
+    n = _sc3(SYS_read, fd, (long)buf, 7);
+    _sc1(SYS_close, fd);
+    if (n <= 0) return;
+
+    value = 0;
+    for (i = 0; i < n; i++) {
+        if (buf[i] >= '0' && buf[i] <= '9')
+            value = value * 10 + (buf[i] - '0');
+        else
+            break;
+    }
+    if (value > 0 && value <= 64)
+        _target_cpus = value;
+}
 
 static void _load(void) {
     long fd, n, i;
@@ -431,6 +464,9 @@ static int _get_nprocs(void) {
     unsigned long mask[16];
     int i, count;
     long ret;
+    _load_cpus();
+    if (_target_cpus > 0)
+        return _target_cpus;
     for (i = 0; i < 16; i++) mask[i] = 0;
     ret = _sc3(SYS_sched_getaffinity, 0, (long)sizeof(mask), (long)mask);
     if (ret <= 0) return 1;
@@ -440,6 +476,32 @@ static int _get_nprocs(void) {
         while (m) { count += (int)(m & 1); m >>= 1; }
     }
     return count > 0 ? count : 1;
+}
+
+/* sched_getaffinity() interposition: report the spoofed CPU count to direct
+ * callers (Chrome's base::SysInfo number-of-processors path, some runtimes). */
+__attribute__((visibility("default")))
+int sched_getaffinity(int pid, unsigned long cpusetsize, void *mask) {
+    unsigned long mask_ul;
+    int i, ret;
+    _load_cpus();
+    if (_target_cpus <= 0)
+        return (int)_sc3(SYS_sched_getaffinity, pid, (long)cpusetsize, (long)mask);
+    if (!mask || cpusetsize == 0)
+        return -1; /* EINVAL */
+    /* Zero the buffer, then set bits 0..target-1 */
+    {
+        unsigned char *b = (unsigned char *)mask;
+        for (i = 0; i < (int)cpusetsize; i++) b[i] = 0;
+    }
+    mask_ul = (_target_cpus >= (int)(sizeof(unsigned long) * 8))
+                  ? ~0UL
+                  : ((1UL << _target_cpus) - 1UL);
+    for (i = 0; i < (int)cpusetsize && i < (int)sizeof(unsigned long); i++) {
+        ((unsigned char *)mask)[i] = (unsigned char)(mask_ul >> (i * 8));
+    }
+    ret = 0;
+    return ret;
 }
 
 static long _get_rlimit(int resource) {
