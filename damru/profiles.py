@@ -137,7 +137,6 @@ def _build_chrome_flags(
         "--disable-component-extensions-with-background-pages",
         "--disable-default-apps",
         "--disable-extensions-http-throttling",
-        "--disable-features=Translate,MediaRouter,DialMediaRouteProvider,OptimizationHints",
         "--start-maximized",
         # Locale
         f"--lang={locale}",
@@ -163,7 +162,6 @@ def _build_chrome_flags(
         "--disable-breakpad",
         "--disable-domain-reliability",
         "--no-pings",
-        "--disable-features=IsolateOrigins,site-per-process",
         # Reduce V8 heap ceiling on Android to mobile-like range.
         "--js-flags=--max-old-space-size=1024",
         # Expose fake media devices so enumerateDevices includes videoinput.
