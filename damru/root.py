@@ -2755,14 +2755,44 @@ echo damru_app_data_dirs_created=$created
         logger.info("Compiled minimal libfakemem.so (%s)", so_path)
         return so_path
 
-    async def setup_app_preload(self, package: str) -> None:
-        """Native RAM/CPU preload for a third-party app (minimal, crash-safe)."""
+    async def setup_app_preload(self, package: str, netcap: bool = False) -> None:
+        """Native RAM/CPU preload for a third-party app (minimal, crash-safe).
+
+        netcap=True also preloads libnetcap.so (in-process socket capture:
+        connect/UDP/DNS/QUIC events per PID) — no APK, no VPN, invisible to
+        the app. Events land in /data/local/tmp/netcap/proc-<pid>.jsonl.
+        """
         so_local = self._compile_fakemem_minimal()
         await self.adb.push(so_local, "/data/local/tmp/libfakemem_min.so")
         await self.adb.shell_root("chmod 755 /data/local/tmp/libfakemem_min.so")
+        libs = "/data/local/tmp/libfakemem_min.so"
+        if netcap:
+            repo_native_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native"
+            )
+            netcap_c = os.path.join(repo_native_dir, "libnetcap.c")
+            build_dir = os.environ.get("DAMRU_NATIVE_BUILD_DIR") or os.path.join(
+                os.path.expanduser("~"), ".cache", "damru-native"
+            )
+            os.makedirs(build_dir, exist_ok=True)
+            netcap_so = os.path.join(build_dir, "libnetcap_x86_64.so")
+            if not os.path.isfile(netcap_so) or os.path.getmtime(netcap_so) < os.path.getmtime(netcap_c):
+                result = subprocess.run(
+                    ["gcc", "-shared", "-fPIC", "-nostdlib", "-fno-stack-protector",
+                     "-DNETCAP_PAYLOAD", "-o", netcap_so, netcap_c],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    raise RootError(f"Failed to compile libnetcap.so:\n{result.stderr}")
+                logger.info("Compiled libnetcap.so (%s)", netcap_so)
+            await self.adb.push(netcap_so, "/data/local/tmp/libnetcap.so")
+            await self.adb.shell_root("chmod 644 /data/local/tmp/libnetcap.so")
+            await self.adb.shell_root("mkdir -p /data/local/tmp/netcap && chmod 777 /data/local/tmp/netcap")
+            await self.adb.shell_root("rm -f /data/local/tmp/netcap/proc-*.jsonl")
+            libs = libs + ":/data/local/tmp/libnetcap.so"
         wrapper = (
             "#!/system/bin/sh\n"
-            "export LD_PRELOAD=/data/local/tmp/libfakemem_min.so\n"
+            f"export LD_PRELOAD={libs}\n"
             'exec "$@"\n'
         )
         b64 = base64.b64encode(wrapper.encode()).decode()
