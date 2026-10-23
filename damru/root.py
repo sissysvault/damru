@@ -2723,6 +2723,61 @@ echo damru_app_data_dirs_created=$created
         await self.adb.shell_root("\n".join(commands), timeout=10)
         logger.info("Installed native preload proc spoof assets")
 
+    @staticmethod
+    def _compile_fakemem_minimal() -> str:
+        """Build the minimal preload (sysconf/sysinfo/sched_getaffinity only).
+
+        The full lib also interposes openat/uname and rewrites /proc maps. That
+        is fine for Chromium but crashes apps with their own native network stack
+        (e.g. Reddit's Cronet). The minimal build keeps CPU/RAM spoofing without
+        touching file/exec paths.
+        """
+        repo_native_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native"
+        )
+        source_c_path = os.path.join(repo_native_dir, "libfakemem.c")
+        build_dir = os.environ.get("DAMRU_NATIVE_BUILD_DIR") or os.path.join(
+            tempfile.gettempdir(), "damru-native"
+        )
+        os.makedirs(build_dir, exist_ok=True)
+        if not os.path.isfile(source_c_path):
+            raise RootError(f"libfakemem.c not found at {source_c_path}")
+        so_path = os.path.join(build_dir, "libfakemem_min_x86_64.so")
+        if os.path.isfile(so_path) and os.path.getmtime(so_path) >= os.path.getmtime(source_c_path):
+            return so_path
+        result = subprocess.run(
+            ["gcc", "-shared", "-fPIC", "-nostdlib", "-fno-stack-protector",
+             "-DDAMRU_MINIMAL", "-o", so_path, source_c_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise RootError(f"Failed to compile minimal libfakemem.so:\n{result.stderr}")
+        logger.info("Compiled minimal libfakemem.so (%s)", so_path)
+        return so_path
+
+    async def setup_app_preload(self, package: str) -> None:
+        """Native RAM/CPU preload for a third-party app (minimal, crash-safe)."""
+        so_local = self._compile_fakemem_minimal()
+        await self.adb.push(so_local, "/data/local/tmp/libfakemem_min.so")
+        await self.adb.shell_root("chmod 755 /data/local/tmp/libfakemem_min.so")
+        wrapper = (
+            "#!/system/bin/sh\n"
+            "export LD_PRELOAD=/data/local/tmp/libfakemem_min.so\n"
+            'exec "$@"\n'
+        )
+        b64 = base64.b64encode(wrapper.encode()).decode()
+        await self.adb.shell_root(f"echo '{b64}' | base64 -d > /data/local/tmp/damru_app_wrap.sh")
+        await self.adb.shell_root("chmod 755 /data/local/tmp/damru_app_wrap.sh")
+        targets = [package]
+        for suffix in (":privileged_process0", ":privileged_process1", ":privileged_process2"):
+            targets.append(f"{package}{suffix}")
+        for n in range(0, 8):
+            targets.append(f"{package}:sandboxed_process{n}")
+        for t in dict.fromkeys(targets):
+            if re.fullmatch(r"[A-Za-z0-9_.:-]+", t):
+                await self.adb.shell_root(f"setprop wrap.{t} /data/local/tmp/damru_app_wrap.sh")
+        logger.info("App preload active for %s (minimal libfakemem)", package)
+
     async def setup_memory_preload(
         self,
         chrome_package: str = "com.android.chrome",

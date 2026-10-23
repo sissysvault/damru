@@ -364,9 +364,11 @@ def resolve_proxy_geo(proxy: Optional[str], retries: int = 3, use_cache: bool = 
     # The URL needs '?' before 'fields=' (the old '/json/fields=' form made
     # ip-api treat the query string as the IP to look up and return junk).
     _ENDPOINTS = [
-        ("https://get.geojs.io/v1/ip/geo.json", lambda d: (d.get("timezone"), d.get("country_code"), d.get("ip"))),
+        # ipinfo first: its GeoIP is what most anti-bot IP->timezone checks use.
         ("https://ipinfo.io/json", lambda d: (d.get("timezone"), d.get("country"), d.get("ip"))),
-        ("https://ipapi.co/json/", lambda d: (d.get("timezone"), d.get("country_code"), d.get("ip"))),
+        ("http://ip-api.com/json/?fields=status,query,timezone,countryCode,lat,lon,regionName,city",
+         lambda d: (d.get("timezone"), d.get("countryCode"), d.get("query"))),
+        ("https://get.geojs.io/v1/ip/geo.json", lambda d: (d.get("timezone"), d.get("country_code"), d.get("ip"))),
     ]
 
     try:
@@ -397,6 +399,13 @@ def resolve_proxy_geo(proxy: Optional[str], retries: int = 3, use_cache: bool = 
                         locale = resolve_locale_for_geo(tz, cc)
                         lat = data.get("latitude") or data.get("lat")
                         lon = data.get("longitude") or data.get("lon")
+                        loc = data.get("loc")
+                        if loc and "," in loc and (lat is None or lon is None):
+                            try:
+                                lat_s, lon_s = loc.split(",", 1)
+                                lat, lon = float(lat_s), float(lon_s)
+                            except (TypeError, ValueError):
+                                pass
                         try:
                             lat = float(lat) if lat is not None else None
                             lon = float(lon) if lon is not None else None

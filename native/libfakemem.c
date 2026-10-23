@@ -742,6 +742,7 @@ long __sysconf(int name) {
 
 /* ── uname/open overrides for wrapped browser processes ── */
 
+#ifndef DAMRU_MINIMAL
 __attribute__((visibility("default")))
 int uname(struct utsname *buf) {
     long ret = _sc1(SYS_uname, (long)buf);
@@ -796,6 +797,7 @@ __attribute__((visibility("default")))
 int open64(const char *pathname, int flags, unsigned long mode) {
     return openat(AT_FDCWD, pathname, flags, mode);
 }
+#endif /* !DAMRU_MINIMAL */
 
 /* ── sysinfo() override ── */
 

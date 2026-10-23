@@ -179,6 +179,7 @@ async def force_device_profile(
     clear_proxy: bool = False,
     slot_identity_seed: str | None = None,
     webrtc_block: bool = True,
+    minimal_preload: bool = False,
 ) -> AppliedDeviceProfile:
     """Force a named Damru profile onto an existing rooted ADB worker.
 
@@ -282,7 +283,7 @@ async def force_device_profile(
     await root.repair_app_data_dirs()
 
     native_preload_disabled = _env_truthy("DAMRU_DISABLE_NATIVE_PRELOAD")
-    if apply_proc_preload and not native_preload_disabled and not configure_chrome and browser_package != "com.android.chrome":
+    if apply_proc_preload and not minimal_preload and not native_preload_disabled and not configure_chrome and browser_package != "com.android.chrome":
         try:
             renderer_targets = _webview_renderer_preload_targets()
             await root.setup_native_proc_preload(
@@ -298,12 +299,17 @@ async def force_device_profile(
     if apply_memory and not native_preload_disabled and not configure_chrome and browser_package != "com.android.chrome":
         try:
             await root.apply_memory_spoof(device.device_memory)
-            renderer_targets = _webview_renderer_preload_targets()
-            await root.setup_memory_preload(
-                browser_package,
-                extra_packages=renderer_targets,
-                restart_webview_zygote=bool(renderer_targets),
-            )
+            if minimal_preload:
+                # Third-party apps (Cronet/OkHttp) crash under the full preload's
+                # openat/uname hooks; use the minimal RAM/CPU-only library.
+                await root.setup_app_preload(browser_package)
+            else:
+                renderer_targets = _webview_renderer_preload_targets()
+                await root.setup_memory_preload(
+                    browser_package,
+                    extra_packages=renderer_targets,
+                    restart_webview_zygote=bool(renderer_targets),
+                )
         except Exception as exc:
             logger.warning("Native preload setup skipped for %s: %s", browser_package, exc)
     elif apply_memory and native_preload_disabled and not configure_chrome and browser_package != "com.android.chrome":
