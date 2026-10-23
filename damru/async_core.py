@@ -1022,6 +1022,15 @@ class AsyncDamru:
         # tab via Playwright CDP can close the mobile target on some builds.
         await self._apply_timezone_override()
         self._wrap_context_new_page()
+        for _p in list(self._context.pages):
+            try:
+                self._guard_page_evaluate(_p)
+            except Exception:
+                pass
+        try:
+            setattr(self._context, "read_page_text", self.read_page_text)
+        except Exception:
+            pass
         _mark("wrap_pages")
 
         # Expose override targets for DamruPoolSync reattach
@@ -1168,6 +1177,67 @@ class AsyncDamru:
             await page.evaluate("() => 1")
             await page.bring_to_front()
 
+    async def read_page_text(self, page: Page) -> str:
+        """Read rendered text via the Accessibility tree (no Runtime, no JS).
+
+        page.evaluate() requires the CDP Runtime domain, which webdriver
+        detectors (Brotector) flag. The Accessibility domain exposes node names
+        without touching Runtime, so automation can read results while the page
+        sees DevTools as fully disabled.
+        """
+        try:
+            cdp = await self._context.new_cdp_session(page)  # type: ignore[union-attr]
+            await cdp.send("Accessibility.enable")
+            tree = await cdp.send("Accessibility.getFullAXTree")
+            await cdp.detach()
+            parts = []
+            for node in tree.get("nodes", []):
+                name = node.get("name") or {}
+                val = name.get("value") if isinstance(name, dict) else None
+                if val:
+                    parts.append(str(val))
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.debug("AX text read failed: %s", exc)
+            return ""
+
+    def _guard_page_evaluate(self, page: Page) -> None:
+        """Re-enable Runtime only around our own evaluate calls.
+
+        The stealth patch disables Runtime shortly after load (and after each
+        navigation) so DevTools/CDP probes see it off. Playwright's evaluate
+        needs Runtime, so enable it just-in-time and disable again after.
+        """
+        if getattr(page, "_damru_eval_guard", False):
+            return
+        original = page.evaluate
+
+        async def _guarded(*a, **k):
+            cdp = getattr(page, "_damru_guard_cdp", None)
+            try:
+                if cdp is None:
+                    cdp = await self._context.new_cdp_session(page)  # type: ignore[union-attr]
+                    setattr(page, "_damru_guard_cdp", cdp)
+                try:
+                    await cdp.send("Runtime.enable")
+                except Exception:
+                    pass
+                return await original(*a, **k)
+            finally:
+                # Close the Runtime window immediately so continuous CDP probes
+                # (Brotector) don't observe an enabled Runtime domain.
+                if cdp is not None:
+                    try:
+                        await cdp.send("Runtime.disable")
+                    except Exception:
+                        pass
+
+        try:
+            setattr(page, "evaluate", _guarded)
+            setattr(page, "_damru_eval_guard", True)
+        except Exception:
+            pass
+
     def _wrap_context_new_page(self) -> None:
         """Normalize Android Chrome tabs before user code navigates them."""
         if not self._context or getattr(self._context, "_damru_new_page_wrapped", False):
@@ -1177,46 +1247,55 @@ class AsyncDamru:
 
         async def _new_page_stable(*args, **kwargs):
             page = await original_new_page(*args, **kwargs)
+            # Do NOT navigate the fresh tab. Playwright already gives an
+            # about:blank target, and an explicit goto here races the stealth
+            # Runtime.enable/disable dance -> "Execution context was destroyed".
+            cdp = None
             try:
-                await page.goto("about:blank", wait_until="load", timeout=5000)
+                cdp = await self._context.new_cdp_session(page)
                 touch_points = getattr(self, "_touch_points", None)
                 timezone = getattr(self, "_sync_timezone", None)
                 ua_payload = getattr(self, "_sync_ua_payload", None)
                 screen_override = getattr(self, "_screen_override", None)
-                if ua_payload or touch_points or timezone or screen_override:
-                    cdp = await self._context.new_cdp_session(page)
-                    if ua_payload:
-                        await cdp.send("Emulation.setUserAgentOverride", ua_payload)
-                    target_cores = getattr(self, "_override_cores", None)
-                    target_memory = getattr(self, "_override_memory", None)
-                    if target_cores:
-                        await cdp.send("Emulation.setHardwareConcurrencyOverride", {"hardwareConcurrency": target_cores})
-                    # deviceMemory is handled via native memory preload (libfakemem.so), not CDP
-                    if screen_override:
-                        sw, sh, sdpi = screen_override
-                        dsf = max(1.0, sdpi / 160.0)
-                        try:
-                            await cdp.send("Emulation.setDeviceMetricsOverride", {
-                                "width": sw, "height": sh,
-                                "deviceScaleFactor": dsf,
-                                "mobile": True,
-                                "screenWidth": sw, "screenHeight": sh,
-                            })
-                        except Exception:
-                            pass
-
-                    if touch_points:
-                        await cdp.send("Emulation.setTouchEmulationEnabled", {
-                            "enabled": True,
-                            "maxTouchPoints": touch_points,
+                if ua_payload:
+                    await cdp.send("Emulation.setUserAgentOverride", ua_payload)
+                target_cores = getattr(self, "_override_cores", None)
+                if target_cores:
+                    await cdp.send("Emulation.setHardwareConcurrencyOverride", {"hardwareConcurrency": target_cores})
+                if screen_override:
+                    sw, sh, sdpi = screen_override
+                    dsf = max(1.0, sdpi / 160.0)
+                    try:
+                        await cdp.send("Emulation.setDeviceMetricsOverride", {
+                            "width": sw, "height": sh, "deviceScaleFactor": dsf,
+                            "mobile": True, "screenWidth": sw, "screenHeight": sh,
                         })
-                    if timezone:
-                        await cdp.send("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-                if os.environ.get("DAMRU_EXPERIMENTAL_CDP_SENSORS", "1") == "1":
-                    await self._apply_sensor_to_page(page)
-                await asyncio.sleep(0.2)
+                    except Exception:
+                        pass
+                if touch_points:
+                    await cdp.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": touch_points})
+                if timezone:
+                    await cdp.send("Emulation.setTimezoneOverride", {"timezoneId": timezone})
             except Exception:
                 pass
+            # Runtime is disabled by the stealth patch ~100ms after load. Re-enable
+            # it for this page's lifetime so user evaluates never hit a torn-down
+            # execution context. Detector JS still sees it disabled on load.
+            async def _runtime_on():
+                if cdp is None:
+                    return
+                try:
+                    await cdp.send("Runtime.enable")
+                except Exception:
+                    pass
+
+            self._guard_page_evaluate(page)
+
+            if os.environ.get("DAMRU_EXPERIMENTAL_CDP_SENSORS", "1") == "1":
+                try:
+                    await self._apply_sensor_to_page(page)
+                except Exception:
+                    pass
             return page
 
         setattr(self._context, "new_page", _new_page_stable)
@@ -1306,6 +1385,9 @@ class AsyncDamru:
             logger.debug("WSL network repair skipped/failed: %s", exc)
 
     async def _apply_devtools_evasion(self) -> None:
+        if os.environ.get("DAMRU_DISABLE_DEBUGGER") == "1":
+            logger.info("DevTools evasion disabled (DAMRU_DISABLE_DEBUGGER=1)")
+            return
         """Neutralize debugger timing detection via CDP (no JS injection).
 
         Debugger.setSkipAllPauses makes `debugger` statements execute as

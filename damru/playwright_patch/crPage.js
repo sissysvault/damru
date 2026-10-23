@@ -505,7 +505,7 @@ class FrameSession {
   _onFrameNavigated(framePayload, initial) {
     if (this._eventBelongsToStaleFrame(framePayload.id))
       return;
-    if (process.env.PLAYWRIGHT_STEALTH_RUNTIME) { clearTimeout(this._stealthDisableTimer); this._client.send("Runtime.enable", {}).catch(() => {}); }
+    if (process.env.PLAYWRIGHT_STEALTH_RUNTIME) { clearTimeout(this._stealthDisableTimer); this._client.send("Runtime.enable", {}).catch(() => {}); this._stealthDisableTimer = setTimeout(() => { this._client.send("Runtime.disable", {}).catch(() => {}); }, 80); /* PLAYWRIGHT_STEALTH_NAVDISABLE_V1 */ }
     this._page.frameManager.frameCommittedNewDocumentNavigation(framePayload.id, framePayload.url + (framePayload.urlFragment || ""), framePayload.name || "", framePayload.loaderId, initial);
     if (!initial)
       this._firstNonInitialNavigationCommittedFulfill();
