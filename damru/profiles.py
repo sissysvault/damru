@@ -71,7 +71,7 @@ def build_profile(
     geo_proxy = http_proxy or proxy or android_proxy
     geo = {}
     try:
-        geo = resolve_proxy_geo(geo_proxy) if geo_proxy else resolve_proxy_geo(None)
+        geo = resolve_proxy_geo(geo_proxy, use_cache=True) if geo_proxy else resolve_proxy_geo(None, use_cache=True)
     except Exception:
         geo = {}
     keep = os.environ.get("DAMRU_KEEP_TIMEZONE") == "1"

@@ -70,7 +70,7 @@ class CDPConnection:
         last_err: Exception | None = None
         for attempt in range(8):
             if not await self._endpoint_ready(port):
-                await sleep(1.5)
+                await sleep(0.3)
                 continue
 
             pw = await async_playwright().start()

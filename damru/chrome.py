@@ -203,7 +203,7 @@ class ChromeManager:
         await self.adb.shell_root(f"chmod 644 {manager._command_line_path()}")
         logger.debug("WebView command-line: %s", cmd_line[:200])
 
-    async def launch(self, url: str = "about:blank", startup_delay: float = 4.0) -> None:
+    async def launch(self, url: str = "about:blank", startup_delay: float = 3.0, skip_service_wait: bool = False) -> None:
         """Launch Chromium-based browser via am start.
 
         After pm clear, Chrome needs extra startup time to initialize
@@ -225,7 +225,8 @@ class ChromeManager:
         except Exception as exc:
             logger.warning("Failed to configure Crashpad directory permissions for %s: %s", package, exc)
 
-        await self._wait_for_android_services(timeout=90.0)
+        if not skip_service_wait:
+            await self._wait_for_android_services(timeout=90.0)
         if self._is_webview_shell():
             activities = [".WebViewBrowserActivity"]
         else:
@@ -243,7 +244,7 @@ class ChromeManager:
                 activity = f"{package}/{activity_name}"
                 try:
                     out = await self.adb.shell(
-                        f"am start -W --activity-clear-top -n {activity} -a android.intent.action.VIEW -d {url}",
+                        f"am start --activity-clear-top -n {activity} -a android.intent.action.VIEW -d {url}",
                         timeout=20,
                     )
                 except Exception as exc:
@@ -251,16 +252,12 @@ class ChromeManager:
                     continue
                 failed = (
                     not out.strip()
-                    or
-                    ("Status: ok" not in out and "Complete" not in out)
-                    or
-                    "Error:" in out
+                    or "Error:" in out
                     or "Error type" in out
                     or "Exception" in out
                     or "Can't find service" in out
                     or "not found; no service started" in out
                     or "does not exist" in out
-                    or "not found" in out.lower()
                 )
                 if not failed:
                     launched = True
@@ -276,8 +273,8 @@ class ChromeManager:
             raise ChromeError(f"Chrome launch failed for {package}: {last_error or '<no output>'}")
         await sleep(startup_delay)
         focus = ""
-        for focus_probe in range(2):
-            for _ in range(12):
+        for focus_probe in range(1):
+            for _ in range(4):
                 focus = await self.adb.shell(
                     "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'; "
                     "dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head",
@@ -285,7 +282,7 @@ class ChromeManager:
                 )
                 if package in focus:
                     return
-                await sleep(1.0)
+                await sleep(0.25)
             if focus_probe == 0 and launched_activity:
                 logger.info("Chrome not focused after launch; retrying VIEW intent")
                 await self.adb.shell(
@@ -467,7 +464,7 @@ class ChromeManager:
             elif "chrome_devtools_remote" in out:
                 self.devtools_socket_name = "chrome_devtools_remote"
                 return True
-            await sleep(1.0)
+            await sleep(0.25)
         logger.warning("Browser devtools socket not found after %.1fs", timeout)
         return False
 
@@ -503,8 +500,10 @@ class ChromeManager:
             "'Last Session' 'Last Tabs' "
             "IndexedDB 'Local Storage' 'Service Worker' "
             "'File System' blob_storage databases "
-            "shared_proto_db Cache 'Code Cache' GPUCache "
+            "shared_proto_db "
             "optimization_guide_hint_cache_store"
+            # Cache / Code Cache / GPUCache intentionally preserved: they hold no
+            # identity but rebuilding them made every warm Chrome launch ~5-8s slower.
             f"; rm -rf /data/data/{pkg}/cache 2>/dev/null; true"
         )
         logger.info("Chrome session data cleaned (Preferences preserved)")

@@ -164,6 +164,10 @@ class AsyncDamru:
         setup_logging(self._debug)
         import time as _time
         _t0 = _time.monotonic()
+        _timing = os.environ.get("DAMRU_TIMING") == "1"
+        def _mark(label: str) -> None:
+            if _timing:
+                logger.info("TIMING %-18s %6.1fs", label, _time.monotonic() - _t0)
 
         # Provider rotating gateways can change exit IP between Python GeoIP,
         # proxy bridge, and Chrome. Normalize once so every layer uses the same
@@ -351,9 +355,20 @@ class AsyncDamru:
                 logger.info("Android version match (%s) - setting ALL props including version", real_android)
 
         async def _apply_all_props():
-            await self._root.apply_device_props(
-                target_device, safe_only=not version_match, parallel=warm_start,
-            )
+            # Idempotence: the container persists across sessions, so a full
+            # 100+ resetprop batch is only needed when the identity changes.
+            import hashlib as _h
+            props_sig = _h.sha256(
+                json.dumps(target_device.system_props(safe_only=not version_match), sort_keys=True).encode()
+            ).hexdigest()[:16]
+            current_sig = (await self._adb.get_prop("persist.damru.profile.sig")).strip()
+            if current_sig == props_sig:
+                logger.info("Device props unchanged (sig %s) - skipping resetprop batch", props_sig)
+            else:
+                await self._root.apply_device_props(
+                    target_device, safe_only=not version_match, parallel=warm_start,
+                )
+                await self._root.set_prop("persist.damru.profile.sig", props_sig)
             await self._root.set_prop("persist.damru.sensor.seed", sensor_seed)
             prop_tasks = [
                 self._root.apply_timezone(self._profile.timezone),
@@ -446,11 +461,17 @@ class AsyncDamru:
             )
 
         await _apply_all_props()
+        _mark("props")
         await _configure_debug_props()
+        _mark("debug_props")
         await self._root.apply_audio_48khz()
+        _mark("audio")
         await _fonts_setup()
+        _mark("fonts")
         await _apply_screen()
+        _mark("screen")
         await _set_proxy()
+        _mark("proxy")
         if warm_start:
             await _start_tts_service()
         else:
@@ -567,23 +588,59 @@ class AsyncDamru:
         # Chrome data or command-line flags during that restart: package/data
         # writes can succeed but Chrome later starts without a DevTools socket.
         await self._root.apply_cpu_cores_spoof(target_device.hardware_concurrency)
+        _mark("cpu")
         # Force cold start on warm Chrome if memory spoofing is active.
         await _memory_spoof()
-        # Force cold start if memory preload was just set up - wrap.* LD_PRELOAD
-        # only affects fresh Chrome processes, not already-running ones.
-        if warm_start and await self._root.is_memory_preload_active(self._chrome.package) and target_device.device_memory:
-            warm_start = False
-            logger.info('Cold start forced: memory spoof active for deviceMemory=%.0f GB', target_device.device_memory)
+        # LD_PRELOAD (wrap.*) applies to the Chrome process at launch. Chrome is
+        # force-stopped on session exit and force-stopped in _chrome_prep, so a
+        # new process already picks it up. Do NOT force a full cold start
+        # (pm clear + FRE + TTS) here - that was the main warm-session slowdown.
         await _gpu_then_battery()
+        _mark("gpu")
         await _wait_adb_ready("GPU/battery setup", timeout=90.0)
+        _mark("adb_ready")
         await _chrome_prep()
+        _mark("chrome_prep")
 
         # Chrome launch with retry - SurfaceFlinger restart kills processes
         # and the system needs variable time to re-register activities.
         # If Chrome doesn't start (no devtools socket), retry with longer delay.
+        async def _root_hardening() -> None:
+            # WebRTC: ALWAYS apply the kernel-level UDP block (0-JS, undetectable,
+            # leak-proof). Spoof mode (webrtc_block=False) previously removed the
+            # block, which exposed the host's real public IP via the WebRTC srflx
+            # candidate (the native --force-webrtc-ip-handling-policy flag does
+            # NOT stop STUN UDP on this setup). The block is only removed when the
+            # user explicitly opts into the legacy JS candidate-rewrite spoof
+            # (DAMRU_WEBRTC_JS_SPOOF=1), which needs real candidates to rewrite.
+            _js_spoof = (not self._webrtc_block) and os.environ.get("DAMRU_WEBRTC_JS_SPOOF") == "1"
+            if _js_spoof:
+                webrtc_label = "WebRTC enable (legacy JS spoof opt-in)"
+                webrtc_factory = lambda: self._root.remove_webrtc_block(self._chrome.package)
+            else:
+                webrtc_label = "WebRTC block (kernel UDP drop)"
+                webrtc_factory = lambda: self._root.apply_webrtc_block(self._chrome.package)
+            async def _run(label, factory):
+                last: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        await _wait_adb_ready(label, timeout=30.0)
+                        await factory()
+                        return
+                    except Exception as exc:
+                        last = exc
+                        logger.warning("%s failed (attempt %d/3): %s", label, attempt + 1, exc)
+                        await sleep(1.0)
+                logger.warning("%s skipped after retries: %s", label, last)
+
+            await asyncio.gather(
+                _run("IPv6 block", self._root.apply_ipv6_block),
+                _run(webrtc_label, webrtc_factory),
+            )
+
         socket_ready = False
         for launch_attempt in range(3):
-            startup_delay = 2.0 if warm_start else 4.0
+            startup_delay = 1.2 if warm_start else 3.0
             if launch_attempt > 0:
                 # Increasing delay: 5s, 10s for retries
                 extra_wait = 5.0 * launch_attempt
@@ -591,7 +648,7 @@ class AsyncDamru:
                 await sleep(extra_wait)
                 await self._chrome.force_stop()
 
-            await self._chrome.launch(startup_delay=startup_delay)
+            await self._chrome.launch(startup_delay=startup_delay, skip_service_wait=warm_start)
 
             if not warm_start and launch_attempt == 0:
                 await self._chrome.dismiss_fre()
@@ -614,41 +671,11 @@ class AsyncDamru:
 
             logger.warning("Devtools socket not found (attempt %d/3)", launch_attempt + 1)
 
+        _mark("chrome_launch")
         if not socket_ready:
             logger.warning("Devtools socket not detected after retries, attempting connection anyway")
 
-        async def _root_hardening() -> None:
-            # WebRTC: ALWAYS apply the kernel-level UDP block (0-JS, undetectable,
-            # leak-proof). Spoof mode (webrtc_block=False) previously removed the
-            # block, which exposed the host's real public IP via the WebRTC srflx
-            # candidate (the native --force-webrtc-ip-handling-policy flag does
-            # NOT stop STUN UDP on this setup). The block is only removed when the
-            # user explicitly opts into the legacy JS candidate-rewrite spoof
-            # (DAMRU_WEBRTC_JS_SPOOF=1), which needs real candidates to rewrite.
-            _js_spoof = (not self._webrtc_block) and os.environ.get("DAMRU_WEBRTC_JS_SPOOF") == "1"
-            if _js_spoof:
-                webrtc_label = "WebRTC enable (legacy JS spoof opt-in)"
-                webrtc_factory = lambda: self._root.remove_webrtc_block(self._chrome.package)
-            else:
-                webrtc_label = "WebRTC block (kernel UDP drop)"
-                webrtc_factory = lambda: self._root.apply_webrtc_block(self._chrome.package)
-            for label, factory in (
-                ("IPv6 block", self._root.apply_ipv6_block),
-                (webrtc_label, webrtc_factory),
-            ):
-                last: Exception | None = None
-                for attempt in range(3):
-                    try:
-                        await _wait_adb_ready(label, timeout=30.0)
-                        await factory()
-                        break
-                    except Exception as exc:
-                        last = exc
-                        logger.warning("%s failed (attempt %d/3): %s", label, attempt + 1, exc)
-                        await sleep(3.0)
-                else:
-                    logger.warning("%s skipped after retries: %s", label, last)
-
+        _mark("hardening")
         await _root_hardening()
         await self._repair_wsl_network_if_needed()
 
@@ -667,6 +694,7 @@ class AsyncDamru:
                 except Exception as e:
                     logger.warning("GPU spoof cleanup on connect failure: %s", e)
             raise
+        _mark("cdp_connect")
 
         # WebRTC IP Spoofing (legacy JS override) — OFF by default.
         # The JS RTCPeerConnection subclass below is itself a detectable
@@ -994,6 +1022,7 @@ class AsyncDamru:
         # tab via Playwright CDP can close the mobile target on some builds.
         await self._apply_timezone_override()
         self._wrap_context_new_page()
+        _mark("wrap_pages")
 
         # Expose override targets for DamruPoolSync reattach
         self._override_cores = getattr(self, "_effective_cores", target_device.hardware_concurrency)
@@ -1020,10 +1049,14 @@ class AsyncDamru:
         if self._timezone is not None and self._locale is not None:
             self._sync_timezone = self._profile.timezone
             return
-        # Always sync from the actual browser egress IP (proxy or direct) so the
-        # timezone can never mismatch the exit IP (Fingerprint Pro "VPN
-        # (timezone mismatch)" flag). Skip only when explicitly pinned.
+        # Timezone is already derived from the egress IP in build_profile (geojs,
+        # proxy-aware, cached). Re-querying through the browser costs seconds and
+        # only matters for rotating proxies. Run it only when a proxy is in use
+        # or when explicitly requested.
         if os.environ.get("DAMRU_KEEP_TIMEZONE") == "1":
+            self._sync_timezone = self._profile.timezone
+            return
+        if not (self._proxy or self._profile.android_http_proxy) and os.environ.get("DAMRU_RESYNC_GEO") != "1":
             self._sync_timezone = self._profile.timezone
             return
 

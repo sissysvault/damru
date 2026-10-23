@@ -1330,6 +1330,17 @@ echo damru_app_data_dirs_created=$created
             logger.warning("Invalid target cores: %d", target_cores)
             return
 
+        # Fast path: synthetic sysfs + bind mounts persist inside the container.
+        cpu_range_expected = "0" if target_cores == 1 else f"0-{target_cores - 1}"
+        fast_marker = f"/data/local/tmp/damru_cpu_spoof_{target_cores}"
+        fast = await self.adb.shell(
+            f"test -f {fast_marker} && cat /sys/devices/system/cpu/online 2>/dev/null",
+            timeout=5, allow_failure=True,
+        )
+        if fast.strip().splitlines() and fast.strip().splitlines()[-1].strip() == cpu_range_expected:
+            logger.info("CPU spoof already active (%d cores) - skipping rebuild", target_cores)
+            return
+
         for path in ("/sys/devices/system/cpu/online", "/proc/stat", "/proc/cpuinfo"):
             try:
                 await self.adb.shell_root(f"umount {path} 2>/dev/null || true")
@@ -1469,6 +1480,10 @@ echo damru_app_data_dirs_created=$created
         )
         cpuinfo_ok = not cpuinfo_leaks.strip()
 
+        try:
+            await self.adb.shell_root(f"touch {fast_marker}")
+        except Exception:
+            pass
         if verify_count == str(target_cores) and proc_count == str(target_cores) and cpuinfo_ok:
             logger.info(
                 "CPU spoofed: %d -> %d cores (/sys + /proc/stat + /proc/cpuinfo bind-mounts)",
