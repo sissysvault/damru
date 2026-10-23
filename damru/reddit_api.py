@@ -52,14 +52,17 @@ def load_token(path: str) -> str:
 
 class RedditAPI:
     def __init__(self, token: str, ops: Optional[dict[str, GqlOp]] = None,
-                 proxy: Optional[str] = None, user_agent: str = DEFAULT_UA):
+                 proxy: Optional[str] = None, user_agent: str = DEFAULT_UA,
+                 impersonate: str = "chrome136", extra_headers: Optional[dict] = None):
         self.token = token
         self.ops = ops or {}
         self.proxy = proxy
         self.user_agent = user_agent
+        self.impersonate = impersonate
+        self.extra_headers = extra_headers or {}
 
     def _headers(self) -> dict[str, str]:
-        return {
+        h = {
             "authorization": f"bearer {self.token}",
             "content-type": "application/json",
             "user-agent": self.user_agent,
@@ -67,6 +70,10 @@ class RedditAPI:
             "x-reddit-retry": "attempt=0, max=0",
             "requesttimestamp": str(int(time.time() * 1000)),
         }
+        for k, v in self.extra_headers.items():
+            if k.lower() not in ("host", "content-length", "accept-encoding"):
+                h[k] = v
+        return h
 
     def _proxies(self) -> Optional[dict]:
         if not self.proxy:
@@ -87,9 +94,22 @@ class RedditAPI:
             "variables": variables if variables is not None else (op.variables_sample if op else {}),
             "extensions": {"persistedQuery": {"version": 1, "sha256Hash": h}},
         }
-        import requests
-        r = requests.post(ENDPOINT, headers=self._headers(), data=json.dumps(body),
-                          proxies=self._proxies(), timeout=timeout)
+        payload = json.dumps(body)
+        try:
+            # Browser TLS/JA3 impersonation — Reddit's edge (Fastly) rejects
+            # Python's default TLS fingerprint with a 403 HTML page.
+            from curl_cffi import requests as creq
+            sess = creq.Session(impersonate=self.impersonate)
+            proxies = None
+            if self.proxy:
+                p_ = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+                proxies = {"http": p_, "https": p_}
+            r = sess.post(ENDPOINT, headers=self._headers(), data=payload,
+                          proxies=proxies, timeout=timeout)
+        except ImportError:
+            import requests
+            r = requests.post(ENDPOINT, headers=self._headers(), data=payload,
+                              proxies=self._proxies(), timeout=timeout)
         raw = r.content
         if raw[:2] == b"\x1f\x8b" or "gzip" in r.headers.get("content-encoding", ""):
             try:
