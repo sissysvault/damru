@@ -2566,7 +2566,7 @@ echo damru_app_data_dirs_created=$created
         )
         source_c_path = os.path.join(repo_native_dir, "libfakemem.c")
         build_dir = os.environ.get("DAMRU_NATIVE_BUILD_DIR") or os.path.join(
-            tempfile.gettempdir(), "damru-native"
+            os.path.expanduser("~"), ".cache", "damru-native"
         )
         os.makedirs(build_dir, exist_ok=True)
         c_path = os.path.join(build_dir, "libfakemem.c")
@@ -2737,7 +2737,7 @@ echo damru_app_data_dirs_created=$created
         )
         source_c_path = os.path.join(repo_native_dir, "libfakemem.c")
         build_dir = os.environ.get("DAMRU_NATIVE_BUILD_DIR") or os.path.join(
-            tempfile.gettempdir(), "damru-native"
+            os.path.expanduser("~"), ".cache", "damru-native"
         )
         os.makedirs(build_dir, exist_ok=True)
         if not os.path.isfile(source_c_path):
