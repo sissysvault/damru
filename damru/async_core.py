@@ -29,6 +29,7 @@ from playwright.async_api import BrowserContext, Page
 from .adb import ADB, ADBError
 from .apk_assets import find_bundle_apk
 from .cdp import CDPConnection
+from .compat import install_page_compat
 from .chrome import ChromeManager
 from .devices import AndroidDevice, get_device, get_random_device, pick_random_android_version, pick_random_chrome_version
 from .netfix import wsl_runtime_network_repair_script
@@ -1021,10 +1022,27 @@ class AsyncDamru:
         # Keep Android Chrome's initial tab alive. Creating/navigating a fresh
         # tab via Playwright CDP can close the mobile target on some builds.
         await self._apply_timezone_override()
+        # Close stale tabs: Chrome Android throttles background tabs, which stalls
+        # JS scanners (Pixelscan stays "scanning...") and inflates the tab count.
+        try:
+            _pages = list(self._context.pages)
+            for _extra in _pages[1:]:
+                try:
+                    await _extra.close()
+                except Exception:
+                    pass
+            if _pages:
+                try:
+                    await _pages[0].bring_to_front()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self._wrap_context_new_page()
         for _p in list(self._context.pages):
             try:
                 self._guard_page_evaluate(_p)
+                install_page_compat(_p)
             except Exception:
                 pass
         try:
@@ -1290,6 +1308,7 @@ class AsyncDamru:
                     pass
 
             self._guard_page_evaluate(page)
+            install_page_compat(page)
 
             if os.environ.get("DAMRU_EXPERIMENTAL_CDP_SENSORS", "1") == "1":
                 try:

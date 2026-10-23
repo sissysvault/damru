@@ -614,6 +614,15 @@ class ChromeManager:
             prefs["background_sync"] = {}
         prefs["background_sync"]["enabled"] = False
 
+        # --- Geolocation permission (native, no prompt) ---
+        # Pixelscan/iphey wait on navigator.geolocation; on Android the permission
+        # is per-site and prompts, which stalls automated scans forever. Default
+        # allow geolocation so the engine-level Emulation override is returned
+        # immediately (the value is our spoofed proxy location, never the host).
+        prof = prefs.setdefault("profile", {})
+        dcsv = prof.setdefault("default_content_setting_values", {})
+        dcsv["geolocation"] = 1
+        # Also allow on the content-settings exceptions map for any origin.
         # --- Sign-in promo suppression ("Make Chrome your own") ---
         # Without this, Chrome shows a sign-in promo screen on first launch
         # that blocks the devtools socket from appearing (no chrome_devtools_remote).
