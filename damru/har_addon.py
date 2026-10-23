@@ -8,7 +8,9 @@ Captures per flow:
 Also records failed flows with status 0 and an error string.
 """
 import base64
+import gzip
 import json
+import zlib
 import os
 import time
 
@@ -43,8 +45,30 @@ def _multi(view):
             return []
 
 
+def _decompress(msg, raw):
+    """Undo gzip/deflate/br content-encoding so bodies are readable in the HAR."""
+    enc = (msg.headers.get("content-encoding", "") or "").lower()
+    try:
+        if "gzip" in enc or raw[:2] == b"\x1f\x8b":
+            return gzip.decompress(raw)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(raw)
+            except Exception:
+                return zlib.decompress(raw, -15)
+        if "br" in enc:
+            try:
+                import brotli  # optional
+                return brotli.decompress(raw)
+            except Exception:
+                return raw
+    except Exception:
+        return raw
+    return raw
+
+
 def _body(msg, mime):
-    raw = msg.raw_content or b""
+    raw = _decompress(msg, msg.raw_content or b"")
     out = {"size": len(raw), "mimeType": mime}
     if not raw:
         return out

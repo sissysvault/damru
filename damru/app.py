@@ -48,6 +48,7 @@ class StealthApp:
         apply_gpu: bool = True,
         launch: bool = True,
         har: Optional[str] = None,
+        netcap: bool = False,
     ):
         self.package = package
         self.device = device or "random"
@@ -60,10 +61,13 @@ class StealthApp:
         self.apply_gpu = apply_gpu
         self.launch = launch
         self.har = har
+        self.netcap = netcap
         self._mitm: Optional[subprocess.Popen] = None
         self._fwd: Optional[subprocess.Popen] = None
         self._serial_resolved: Optional[str] = None
         self._container_ip: str = ""
+        self._prev_proxy: str = ""
+        self._rules: list[str] = []
 
     # ── HAR capture (one-stop, app-agnostic) ─────────────────────────
     def _sh(self, *args: str, timeout: int = 30) -> str:
@@ -125,14 +129,12 @@ class StealthApp:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(1.2)
         self._container_ip = self._detect_container_ip()
-        if self._container_ip:
-            subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
-                            self._container_ip, "-p", "tcp", "--dport", "443",
-                            "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
-            subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
-                            self._container_ip, "-p", "tcp", "--dport", "80",
-                            "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
-        logger.info("App HAR capture -> %s", har_path)
+        gw = self._host_gateway()
+        # System proxy is the simplest full-coverage egress (Cronet honors it).
+        prev = self._sh("shell", "settings", "get", "global", "http_proxy").strip()
+        self._prev_proxy = prev if prev not in ("", "null", ":0") else ""
+        self._sh("shell", "settings", "put", "global", "http_proxy", f"{gw}:8080")
+        logger.info("App HAR capture -> %s (device proxy %s:8080)", har_path, gw)
 
     async def _stop_capture(self) -> None:
         if self._container_ip:
@@ -148,6 +150,8 @@ class StealthApp:
                 self._mitm.kill()
         if self._fwd:
             self._fwd.terminate()
+        # restore/clear device proxy
+        self._sh("shell", "settings", "put", "global", "http_proxy", self._prev_proxy or ":0")
         logger.info("App HAR saved -> %s", self.har)
 
     async def __aenter__(self) -> "StealthAppResult":
@@ -156,8 +160,14 @@ class StealthApp:
             adb = ADB(self.serial) if self.serial else ADB()
             await adb.ensure_server()
             self._serial_resolved = self.serial or await adb.detect_device()
+        # Apply profile first (it sets the SOCKS5 bridge as system proxy), then
+        # start capture, which overrides the proxy to point at mitmproxy. Order
+        # matters: the capture must be the final proxy writer.
+        result = await self.apply(launch=(not self.har) and self.launch)
+        if self.har:
             await self._start_capture()
-        result = await self.apply()
+            if self.launch:
+                result.activity = await self.launch_app()
         return result
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -167,7 +177,21 @@ class StealthApp:
             except Exception as e:
                 logger.warning("HAR stop failed: %s", e)
 
-    async def apply(self) -> StealthAppResult:
+    async def launch_app(self, package: Optional[str] = None) -> str:
+        """Resolve and start the app, return the activity component."""
+        package = package or self.package
+        adb = ADB(self._serial_resolved) if self._serial_resolved else ADB()
+        out = await adb.shell(f"cmd package resolve-activity --brief {package}", allow_failure=True)
+        activity = (out.strip().splitlines() or [""])[-1].strip()
+        if activity:
+            await adb.shell(f"am force-stop {package}", allow_failure=True)
+            await adb.shell(f"am start -W -n {activity}", allow_failure=True)
+            logger.info("Launched %s (%s)", package, activity)
+        else:
+            logger.warning("Could not resolve launch activity for %s", package)
+        return activity
+
+    async def apply(self, launch: Optional[bool] = None) -> StealthAppResult:
         adb = ADB(self.serial) if self.serial else ADB()
         await adb.ensure_server()
         serial = self.serial or await adb.detect_device()
@@ -187,10 +211,18 @@ class StealthApp:
             apply_gpu=self.apply_gpu,
             apply_memory=self.apply_memory,
             minimal_preload=True,
+            netcap_preload=self.netcap,
         )
 
         activity = ""
-        if self.launch:
+        if self.har:
+            # stop first so every connection is created after the capture proxy
+            try:
+                adb0 = ADB(self._serial_resolved) if self._serial_resolved else ADB()
+                await adb0.shell(f"am force-stop {self.package}", allow_failure=True)
+            except Exception:
+                pass
+        if (self.launch if launch is None else launch):
             out = await adb.shell(
                 f"cmd package resolve-activity --brief {self.package}",
                 allow_failure=True,

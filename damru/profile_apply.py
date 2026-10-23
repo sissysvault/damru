@@ -180,6 +180,7 @@ async def force_device_profile(
     slot_identity_seed: str | None = None,
     webrtc_block: bool = True,
     minimal_preload: bool = False,
+    netcap_preload: bool = False,
 ) -> AppliedDeviceProfile:
     """Force a named Damru profile onto an existing rooted ADB worker.
 
@@ -301,8 +302,9 @@ async def force_device_profile(
             await root.apply_memory_spoof(device.device_memory)
             if minimal_preload:
                 # Third-party apps (Cronet/OkHttp) crash under the full preload's
-                # openat/uname hooks; use the minimal RAM/CPU-only library.
-                await root.setup_app_preload(browser_package)
+                # openat/uname hooks; use the minimal RAM/CPU-only library, and
+                # optionally the socket-capture library alongside it.
+                await root.setup_app_preload(browser_package, netcap=netcap_preload)
             else:
                 renderer_targets = _webview_renderer_preload_targets()
                 await root.setup_memory_preload(
