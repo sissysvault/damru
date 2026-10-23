@@ -1243,6 +1243,70 @@ echo damru_app_data_dirs_created=$created
             await self.adb.shell_root(f"{rule} 2>/dev/null || true")
         logger.info("WebRTC iptables rules removed")
 
+    async def ensure_monochrome_platform_patch(self) -> bool:
+        """Natively patch "Linux armv81" -> "Linux armv8l" in libmonochrome_64.so.
+
+        Chrome (trichrome) loads libmonochrome_64.so from the installed
+        Trichrome/WebView library; its embedded platform string is what
+        navigator.platform returns in the page and in workers. Redroid's build
+        ships the mangled "armv81", which real Android devices do not report.
+        Same-length byte replacement keeps the ELF intact. Idempotent.
+        """
+        if os.environ.get("DAMRU_DISABLE_MONOCHROME_PLATFORM_PATCH") == "1":
+            return False
+        try:
+            out = await self.adb.shell(
+                "su 0 find /data/app -name libmonochrome_64.so 2>/dev/null",
+                timeout=20, allow_failure=True,
+            )
+            paths = [line.strip() for line in out.splitlines() if "/libmonochrome_64.so" in line]
+            if not paths:
+                return False
+            patched_any = False
+            for remote in paths:
+                quoted = shlex.quote(remote)
+                count_raw = await self.adb.shell(
+                    f"su 0 grep -ac 'armv81' {quoted} 2>/dev/null",
+                    timeout=30, allow_failure=True,
+                )
+                try:
+                    count = int((count_raw or "0").strip() or "0")
+                except ValueError:
+                    count = 0
+                if count <= 0:
+                    continue
+                # Stop Chrome before touching a possibly mmap'd library.
+                await self.adb.shell("am force-stop com.android.chrome", allow_failure=True)
+                local = os.path.join(tempfile.gettempdir(), "damru_libmonochrome.so")
+                try:
+                    await self.adb.pull(remote, local, timeout=300)
+                    with open(local, "rb") as f:
+                        data = f.read()
+                    if b"Linux armv81" not in data:
+                        continue
+                    data = data.replace(b"Linux armv81", b"Linux armv8l")
+                    with open(local, "wb") as f:
+                        f.write(data)
+                    await self.adb.push(local, "/data/local/tmp/damru_libmonochrome.so")
+                    await self.adb.shell_root(
+                        f"cat /data/local/tmp/damru_libmonochrome.so > {quoted}; "
+                        f"chmod 644 {quoted}; restorecon {quoted} 2>/dev/null || true; "
+                        "rm -f /data/local/tmp/damru_libmonochrome.so"
+                    )
+                    patched_any = True
+                    logger.info("Native platform patch: Linux armv81 -> armv8l in %s", remote)
+                finally:
+                    try:
+                        os.unlink(local)
+                    except OSError:
+                        pass
+            if patched_any:
+                await self.adb.shell("am force-stop com.android.chrome", allow_failure=True)
+            return patched_any
+        except Exception as exc:
+            logger.warning("Monochrome platform patch skipped: %s", exc)
+            return False
+
     async def apply_cpu_cores_spoof(
         self,
         target_cores: int,

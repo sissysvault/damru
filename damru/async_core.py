@@ -967,6 +967,11 @@ class AsyncDamru:
                 android_version=target_device.android_version,
             ),
         )
+        # Align worker realms to page UA/platform/locale without Runtime (no CDP tell)
+        with contextlib.suppress(Exception):
+            await self._apply_worker_emulation(self._sync_ua_payload, self._profile.locale)
+        with contextlib.suppress(Exception):
+            await self._apply_geolocation_override()
         # Stealth100: canvas/audio per-session noise (single minimal JS, native-mimicking)
         await self._apply_canvas_noise(target_device)
         if os.environ.get("DAMRU_EXPERIMENTAL_CDP_SENSORS", "1") == "1":
@@ -1015,7 +1020,10 @@ class AsyncDamru:
         if self._timezone is not None and self._locale is not None:
             self._sync_timezone = self._profile.timezone
             return
-        if not (self._profile.android_http_proxy or self._proxy):
+        # Always sync from the actual browser egress IP (proxy or direct) so the
+        # timezone can never mismatch the exit IP (Fingerprint Pro "VPN
+        # (timezone mismatch)" flag). Skip only when explicitly pinned.
+        if os.environ.get("DAMRU_KEEP_TIMEZONE") == "1":
             self._sync_timezone = self._profile.timezone
             return
 
@@ -1039,7 +1047,9 @@ class AsyncDamru:
                     timezone = parsed.get("timezone")
                     country_code = parsed.get("country_code") or parsed.get("country") or parsed.get("countryCode")
                     if timezone:
-                        data = {"timezone": timezone, "country_code": country_code}
+                        data = {"timezone": timezone, "country_code": country_code,
+                                "latitude": parsed.get("lat") or parsed.get("latitude"),
+                                "longitude": parsed.get("lon") or parsed.get("longitude")}
                         break
                 except Exception:
                     continue
@@ -1050,6 +1060,13 @@ class AsyncDamru:
 
             timezone = data["timezone"]
             country_code = data.get("country_code")
+            if data.get("latitude") is not None and data.get("longitude") is not None:
+                try:
+                    self._profile.latitude = float(data["latitude"])
+                    self._profile.longitude = float(data["longitude"])
+                    await self._apply_geolocation_override()
+                except Exception:
+                    pass
 
             changed = []
             if self._timezone is None and timezone != self._profile.timezone:
@@ -1735,22 +1752,9 @@ class AsyncDamru:
             p.split(";")[0].strip() for p in accept_lang_header.split(",")
         )
 
-        # Mirror the real Worker realm's platform/languages so page and worker
-        # report identical values (detectors flag main/worker divergence).
-        _ident_page = self._context.pages[0] if self._context and self._context.pages else None
-        native_ident = await self._read_worker_native_identity(_ident_page) if _ident_page else None
+        # Page uses realistic values; workers are aligned to the same values by
+        # _apply_worker_emulation (raw CDP Emulation, no Runtime => no CDP tell).
         override_platform = "Linux armv8l"
-        if native_ident:
-            wp = (native_ident.get("p") or "").strip()
-            wl = native_ident.get("l") or []
-            if wp:
-                override_platform = wp
-            if wl:
-                accept_lang_tags = ",".join(wl)
-            logger.info(
-                "Worker identity mirror: platform=%s languages=%s",
-                override_platform, accept_lang_tags,
-            )
 
         ua_payload = {
             "userAgent": ua,
@@ -1789,6 +1793,110 @@ class AsyncDamru:
         self._spoofed_android_version = android_ver
         self._spoofed_sdk_version = sdk_ver
         self._spoofed_chrome_version = chrome_ver
+
+    async def _apply_worker_emulation(self, ua_payload: dict, locale: str) -> None:
+        """Align worker realms to page UA/platform/locale via raw CDP Emulation.
+
+        Engine-level only: attaches to each page session, auto-attaches worker
+        targets (without pausing), and sends Emulation.setUserAgentOverride
+        (with acceptLanguage) + Emulation.setLocaleOverride. Runtime is never
+        enabled and workers are never paused, so the
+        Error.prepareStackTrace/console.log CDP-in-worker probe stays clean.
+        """
+        if not self._context or not ua_payload:
+            return
+        port = getattr(self, "_cdp_port", None) or getattr(self._cdp, "_local_port", None)
+        if not port:
+            return
+        try:
+            import itertools
+            import urllib.request
+            import websockets
+        except Exception:
+            return
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5) as resp:
+                ws_url = json.loads(resp.read().decode("utf-8")).get("webSocketDebuggerUrl")
+            if not ws_url:
+                return
+            ws = await websockets.connect(ws_url, max_size=None)
+        except Exception as exc:
+            logger.debug("Worker emulation connect failed: %s", exc)
+            return
+
+        counter = itertools.count(1)
+        lock = asyncio.Lock()
+        pending: dict = {}
+
+        async def _send(method, params=None, session_id=None, wait=False):
+            mid = next(counter)
+            msg = {"id": mid, "method": method, "params": params or {}}
+            if session_id:
+                msg["sessionId"] = session_id
+            fut = None
+            if wait:
+                fut = asyncio.get_running_loop().create_future()
+                pending[mid] = fut
+            async with lock:
+                await ws.send(json.dumps(msg))
+            if fut:
+                try:
+                    return await asyncio.wait_for(fut, timeout=6)
+                except Exception:
+                    return None
+            return None
+
+        async def _arm_page(session_id: str) -> None:
+            if not session_id:
+                return
+            await _send(
+                "Target.setAutoAttach",
+                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                session_id,
+            )
+
+        async def _reader():
+            try:
+                async for raw in ws:
+                    ev = json.loads(raw)
+                    mid = ev.get("id")
+                    if mid in pending:
+                        fut = pending.pop(mid)
+                        if not fut.done():
+                            fut.set_result(ev)
+                        continue
+                    if ev.get("method") != "Target.attachedToTarget":
+                        continue
+                    params = ev.get("params", {})
+                    info = params.get("targetInfo", {})
+                    sid = params.get("sessionId")
+                    if not sid:
+                        continue
+                    if info.get("type") in {"worker", "service_worker", "shared_worker"}:
+                        try:
+                            await _send("Emulation.setUserAgentOverride", ua_payload, sid)
+                            await _send("Emulation.setLocaleOverride", {"locale": locale}, sid)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_reader())
+        try:
+            await _send("Target.setDiscoverTargets", {"discover": True})
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as resp:
+                targets = json.loads(resp.read().decode("utf-8"))
+            for t in targets:
+                if t.get("type") != "page" or not t.get("id"):
+                    continue
+                resp = await _send("Target.attachToTarget", {"targetId": t["id"], "flatten": True}, wait=True)
+                sid = ((resp or {}).get("result") or {}).get("sessionId")
+                await _arm_page(sid)
+            self._raw_cdp_tasks.append(task)
+            self._raw_cdp_ws = ws
+            logger.info("Worker emulation armed (UA/platform/locale, no Runtime)")
+        except Exception as exc:
+            logger.debug("Worker emulation setup failed: %s", exc)
 
     async def _apply_locale_override(self, locale: str) -> None:
         """Override Intl locale via CDP Emulation.setLocaleOverride.

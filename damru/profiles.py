@@ -5,6 +5,7 @@ Assembles system props and Chrome CLI flags from a device profile
 """
 from __future__ import annotations
 
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -28,6 +29,8 @@ class DamruProfile:
     timezone: str
     locale: str
     android_http_proxy: Optional[str] = None  # "host:port" for system proxy
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     description: str = ""
 
 
@@ -61,13 +64,24 @@ def build_profile(
     # Auto-detect timezone/locale through an authenticated URL when present.
     # Android settings store only host:port, so using that stripped value for
     # GeoIP can fail against username/password proxies.
+    # Always derive geo from the actual egress IP (proxy if set, else direct).
+    # A timezone that does not match the exit IP is flagged as "VPN (timezone
+    # mismatch)" by Fingerprint Pro / BrowserScan, so IP-derived geo wins unless
+    # the operator explicitly pins it with DAMRU_KEEP_TIMEZONE=1.
     geo_proxy = http_proxy or proxy or android_proxy
-    if geo_proxy and (timezone is None or locale is None):
-        geo = resolve_proxy_geo(geo_proxy)
-        if timezone is None:
-            timezone = geo["timezone"]
-        if locale is None:
-            locale = geo["locale"]
+    geo = {}
+    try:
+        geo = resolve_proxy_geo(geo_proxy) if geo_proxy else resolve_proxy_geo(None)
+    except Exception:
+        geo = {}
+    keep = os.environ.get("DAMRU_KEEP_TIMEZONE") == "1"
+    if geo:
+        if keep:
+            timezone = timezone or geo.get("timezone")
+            locale = locale or geo.get("locale")
+        else:
+            timezone = geo.get("timezone") or timezone
+            locale = geo.get("locale") or locale
 
     if timezone is None:
         timezone = "America/New_York"
@@ -96,6 +110,8 @@ def build_profile(
         timezone=timezone,
         locale=locale,
         android_http_proxy=android_proxy,
+        latitude=geo.get("latitude"),
+        longitude=geo.get("longitude"),
         description=description,
     )
 
@@ -143,10 +159,16 @@ def _build_chrome_flags(
         # navigator.languages must NOT contain q-values - only lang tags.
         # Chrome auto-assigns q-weights in the HTTP Accept-Language header.
         f"--accept-lang={','.join(p.split(';')[0].strip() for p in accept_lang.split(','))}",
-        # WebRTC: keep enabled but force routing through proxy if webrtc_block is False (default).
-        # When webrtc_block is True, we use default policy (as iptables drops all UDP).
-        f"--force-webrtc-ip-handling-policy={'default_public_and_private_interfaces' if webrtc_block else 'disable_non_proxied_udp'}",
+        # WebRTC: ALWAYS disable non-proxied UDP at the engine level so STUN
+        # cannot gather a public (srflx) candidate that leaks the real/host IP.
+        # This is native (command-line flag), independent of iptables, and keeps
+        # WebRTC "enabled" (no disabled-API tell) while only exposing mDNS host
+        # candidates. Kernel UDP drop remains as defense-in-depth.
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--enforce-webrtc-ip-permission-check",
+        # Keep local-IP hiding via mDNS (.local host candidates), matching real
+        # Android Chrome and preventing private-IP exposure.
+        "--enable-features=WebRtcHideLocalIpsWithMdns",
         # Rendering
         "--force-color-profile=srgb",
         "--dns-prefetch-disable",

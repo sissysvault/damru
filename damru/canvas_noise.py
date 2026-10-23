@@ -155,4 +155,10 @@ def canvas_noise_js(seed: str) -> str:
 """
 
 def should_inject() -> bool:
-    return os.environ.get("DAMRU_DISABLE_CANVAS_NOISE") != "1"
+    """Native-only by default: no JS injection unless explicitly opted in.
+
+    Set DAMRU_ENABLE_JS_SPOOF=1 to enable the legacy JS shims (webdriver delete,
+    plugin array, canvas/audio noise). Native Chrome already handles webdriver,
+    permissions and window.chrome; Android genuinely has 0 plugins.
+    """
+    return os.environ.get("DAMRU_ENABLE_JS_SPOOF") == "1"

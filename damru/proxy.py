@@ -329,7 +329,7 @@ def _extract_host_port(url: str) -> str:
     return url
 
 
-def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> Dict[str, str]:
+def resolve_proxy_geo(proxy: Optional[str], retries: int = 3, use_cache: bool = False) -> Dict[str, str]:
     """Resolve timezone, locale, country from proxy exit IP via GeoIP lookup.
 
     Connects THROUGH the proxy to GeoIP services. Results are cached per proxy URL.
@@ -337,8 +337,9 @@ def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> 
     for rotating proxies that drop connections.
     """
     proxy = make_sticky_proxy_url(proxy) or proxy
+    cache_key = proxy or "__direct__"
 
-    if use_cache and proxy in _geo_cache:
+    if use_cache and cache_key in _geo_cache:
         return _geo_cache[proxy]
 
     defaults = {
@@ -346,6 +347,10 @@ def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> 
         "locale": "en-US",
         "country_code": "US",
         "ip": "",
+        "latitude": None,
+        "longitude": None,
+        "region": "",
+        "city": "",
     }
 
     # GeoIP endpoints. ip-api.com is MaxMind-derived — the same family of data
@@ -359,7 +364,7 @@ def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> 
     # The URL needs '?' before 'fields=' (the old '/json/fields=' form made
     # ip-api treat the query string as the IP to look up and return junk).
     _ENDPOINTS = [
-        ("http://ip-api.com/json/?fields=status,query,timezone,countryCode", lambda d: (d.get("timezone"), d.get("countryCode"), d.get("query"))),
+        ("https://get.geojs.io/v1/ip/geo.json", lambda d: (d.get("timezone"), d.get("country_code"), d.get("ip"))),
         ("https://ipinfo.io/json", lambda d: (d.get("timezone"), d.get("country"), d.get("ip"))),
         ("https://ipapi.co/json/", lambda d: (d.get("timezone"), d.get("country_code"), d.get("ip"))),
     ]
@@ -371,12 +376,14 @@ def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> 
         # Build proxy dict for requests. Bare host:port values are Android
         # system HTTP proxies, including local CONNECT bridges. Resolve GeoIP
         # through the same path Android Chrome will use to avoid timezone leaks.
-        proxy_url = proxy
-        if "://" not in proxy_url:
-            proxy_url = f"http://{proxy_url}"
-        if "socks5://" in proxy_url and "socks5h://" not in proxy_url:
-            proxy_url = proxy_url.replace("socks5://", "socks5h://")
-        proxies = {"http": proxy_url, "https": proxy_url}
+        proxies = None
+        if proxy:
+            proxy_url = proxy
+            if "://" not in proxy_url:
+                proxy_url = f"http://{proxy_url}"
+            if "socks5://" in proxy_url and "socks5h://" not in proxy_url:
+                proxy_url = proxy_url.replace("socks5://", "socks5h://")
+            proxies = {"http": proxy_url, "https": proxy_url}
 
         last_err = None
         for attempt in range(1, retries + 1):
@@ -388,16 +395,28 @@ def resolve_proxy_geo(proxy: str, retries: int = 3, use_cache: bool = False) -> 
 
                     if tz:
                         locale = resolve_locale_for_geo(tz, cc)
+                        lat = data.get("latitude") or data.get("lat")
+                        lon = data.get("longitude") or data.get("lon")
+                        try:
+                            lat = float(lat) if lat is not None else None
+                            lon = float(lon) if lon is not None else None
+                        except (TypeError, ValueError):
+                            lat = lon = None
                         result = {
                             "timezone": tz,
                             "locale": locale,
                             "country_code": cc or "US",
                             "ip": ip or "",
+                            "latitude": lat,
+                            "longitude": lon,
+                            "region": data.get("region") or data.get("region_name") or "",
+                            "city": data.get("city") or "",
                         }
                         if use_cache:
-                            _geo_cache[proxy] = result
-                        logger.info("Proxy GeoIP: %s -> %s (%s) via %s",
-                                    proxy.split("@")[-1][:30], tz, locale,
+                            _geo_cache[cache_key] = result
+                        logger.info("GeoIP (%s): %s -> %s (%s) via %s",
+                                    "proxy" if proxy else "direct",
+                                    (proxy or "direct").split("@")[-1][:30], tz, locale,
                                     url.split("/")[2])
                         return result
                 except Exception as e:
