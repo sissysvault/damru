@@ -203,13 +203,16 @@ def _build_chrome_flags(
         # NOTE: AutomationControlled already disabled above; no duplicate needed
     ]
 
-    # -- TLS fingerprint randomization -----------------------------
-    # Randomize Chrome's JA3/JA4 TLS fingerprint per session by:
-    # 1. Blacklisting random non-essential TLS 1.2 cipher suites
-    # 2. Toggling PostQuantumKyber (changes supported_groups extension)
-    # This produces ~186 unique JA3 hashes from a single Chrome binary.
-    tls_flags, tls_disabled = _randomize_tls_flags()
-    flags.extend(tls_flags)
+    # -- TLS fingerprint -------------------------------------------------
+    # Default: present Chrome's AUTHENTIC JA3/JA4. Randomizing ciphers/ALPS/ECH
+    # produces non-Chrome TLS fingerprints that bot managers (Akamai, Cloudflare,
+    # DataDome) flag as inconsistent with the Chrome UA. Diversity comes from
+    # Chrome version rotation, not from breaking the TLS stack.
+    if os.environ.get("DAMRU_RANDOMIZE_TLS") == "1":
+        tls_flags, tls_disabled = _randomize_tls_flags()
+        flags.extend(tls_flags)
+    else:
+        tls_disabled = []
 
     # Force the full user-agent string at native level so first Chrome
     # page load already has correct platform (Linux armv8l) instead of
