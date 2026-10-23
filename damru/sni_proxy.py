@@ -167,6 +167,9 @@ async def dial_direct(host: str, port: int) -> Optional[Tuple]:
         return None
 
 
+VIA = ""
+
+
 # ── Relay ───────────────────────────────────────────────────────────
 
 class Logger:
@@ -220,7 +223,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             return
 
         up = upstream
-        if up["scheme"] == "socks5":
+        if VIA:
+            conn = await dial_via(VIA, host, port)
+        elif up["scheme"] == "socks5":
             conn = await dial_socks5(up, host, port)
         elif up["scheme"] in ("http", "https"):
             conn = await dial_http(up, host, port)
@@ -274,13 +279,34 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             pass
 
 
+async def dial_via(via: str, host: str, port: int):
+    try:
+        vh, vp = via.rsplit(":", 1)
+        r, w = await asyncio.wait_for(asyncio.open_connection(vh, int(vp)), timeout=15)
+        w.write(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+        await w.drain()
+        line = await r.readline()
+        if b" 200" not in line:
+            w.close(); return None
+        while True:
+            h = await r.readline()
+            if h in (b"\r\n", b"\n", b""):
+                break
+        return r, w
+    except Exception:
+        return None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="damru.sni_proxy")
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument("--upstream", default="direct", help="socks5://user:pass@host:port | http://... | direct")
     ap.add_argument("--log", default="flows.jsonl")
+    ap.add_argument("--via", default="", help="host:port of a downstream HTTP proxy (e.g. mitmproxy) to chain through")
     args = ap.parse_args(argv)
 
+    global VIA
+    VIA = args.via
     lh, lp = args.listen.rsplit(":", 1)
     u = urlparse(args.upstream if "://" in args.upstream else "direct://")
     upstream = {

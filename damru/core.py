@@ -46,6 +46,7 @@ class Damru:
         profile_tier: Optional[str] = None,
         restore_props: bool = True,
         debug: bool = False,
+        har: Optional[str] = None,
     ):
         self._async_damru = AsyncDamru(
             device=device,
@@ -57,6 +58,7 @@ class Damru:
             profile_tier=profile_tier,
             restore_props=restore_props,
             debug=debug,
+            har=har,
         )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._context: Optional[BrowserContext] = None

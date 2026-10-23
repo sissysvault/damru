@@ -30,6 +30,7 @@ from .adb import ADB, ADBError
 from .apk_assets import find_bundle_apk
 from .cdp import CDPConnection
 from .compat import install_page_compat
+from .har_recorder import HARRecorder
 from .chrome import ChromeManager
 from .devices import AndroidDevice, get_device, get_random_device, pick_random_android_version, pick_random_chrome_version
 from .netfix import wsl_runtime_network_repair_script
@@ -86,6 +87,7 @@ class AsyncDamru:
         force_cold_start: bool = False,
         debug: bool = False,
         webrtc_block: bool = True,
+        har: Optional[str] = None,
     ):
         self._device_name = device
         self._serial = serial
@@ -106,6 +108,8 @@ class AsyncDamru:
         self._keep_chrome_on_exit = keep_chrome_on_exit
         self._force_cold_start = force_cold_start
         self._debug = debug
+        self._har_path = har
+        self._har: Optional[HARRecorder] = None
 
         # Initialized during __aenter__
         self._adb: Optional[ADB] = None
@@ -1056,6 +1060,15 @@ class AsyncDamru:
         self._override_memory = target_device.device_memory
         self._cdp_port = self._cdp._local_port
 
+        if self._har_path:
+            try:
+                self._har = HARRecorder(self._context, self._har_path)
+                await self._har.start()
+                logger.info("HAR recording -> %s", self._har_path)
+            except Exception as exc:
+                logger.warning("HAR recording disabled: %s", exc)
+                self._har = None
+
         _elapsed = _time.monotonic() - _t0
         logger.info("Ready in %.1fs! (%s - root + CDP - zero JS injection)",
                      _elapsed, "warm" if warm_start else "cold")
@@ -1345,6 +1358,14 @@ class AsyncDamru:
             with contextlib.suppress(Exception):
                 await self._raw_cdp_ws.close()
             self._raw_cdp_ws = None
+
+        if self._har is not None:
+            try:
+                await self._har.stop()
+                logger.info("HAR saved -> %s", self._har_path)
+            except Exception as exc:
+                logger.warning("HAR save failed: %s", exc)
+            self._har = None
 
         # Disconnect CDP
         if self._cdp:

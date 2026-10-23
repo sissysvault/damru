@@ -11,6 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import asyncio
+import base64
+import os
+import signal
+import subprocess
+import time
+from pathlib import Path
+
 from .adb import ADB
 from .profile_apply import AppliedDeviceProfile, force_device_profile
 from .utils import logger
@@ -39,6 +47,7 @@ class StealthApp:
         apply_memory: bool = True,
         apply_gpu: bool = True,
         launch: bool = True,
+        har: Optional[str] = None,
     ):
         self.package = package
         self.device = device or "random"
@@ -50,6 +59,113 @@ class StealthApp:
         self.apply_memory = apply_memory
         self.apply_gpu = apply_gpu
         self.launch = launch
+        self.har = har
+        self._mitm: Optional[subprocess.Popen] = None
+        self._fwd: Optional[subprocess.Popen] = None
+        self._serial_resolved: Optional[str] = None
+        self._container_ip: str = ""
+
+    # ── HAR capture (one-stop, app-agnostic) ─────────────────────────
+    def _sh(self, *args: str, timeout: int = 30) -> str:
+        cmd = ["adb"] + (["-s", self._serial_resolved] if self._serial_resolved else []) + list(args)
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        except Exception:
+            return ""
+
+    def _host_gateway(self) -> str:
+        for line in self._sh("shell", "ip", "route").splitlines():
+            if line.startswith("default via "):
+                return line.split()[2]
+        return "172.17.0.1"
+
+    def _detect_container_ip(self) -> str:
+        for line in self._sh("shell", "ip", "-4", "addr", "show").splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "127.0.0.1" not in line:
+                return line.split()[1].split("/")[0]
+        return ""
+
+    def _install_ca(self) -> None:
+        cert = Path(os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem"))
+        if not cert.exists():
+            try:
+                subprocess.run(["mitmdump", "--listen-port", "8099", "-q"], timeout=3,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        if not cert.exists():
+            raise RuntimeError("mitmproxy CA not found")
+        self._sh("push", str(cert), "/data/local/tmp/mitm.pem")
+        script = (
+            "mkdir -p /data/local/tmp/cacerts; "
+            "cp -f /apex/com.android.conscrypt/cacerts/* /data/local/tmp/cacerts/ 2>/dev/null || true; "
+            "cp -f /data/local/tmp/mitm.pem /data/local/tmp/cacerts/c8750f0d.0; "
+            "chmod 644 /data/local/tmp/cacerts/*; "
+            "mount --bind /data/local/tmp/cacerts /apex/com.android.conscrypt/cacerts || true"
+        )
+        tmp = Path("/tmp/_damru_ca.sh"); tmp.write_text("#!/system/bin/sh\n" + script + "\n")
+        self._sh("push", str(tmp), "/data/local/tmp/_damru_ca.sh")
+        self._sh("shell", "su", "0", "sh", "/data/local/tmp/_damru_ca.sh")
+
+    async def _start_capture(self) -> None:
+        assert self.har
+        har_path = Path(self.har).expanduser()
+        har_path.parent.mkdir(parents=True, exist_ok=True)
+        self._install_ca()
+        env = dict(os.environ, DAMRU_HAR_OUT=str(har_path))
+        self._mitm = subprocess.Popen(
+            ["mitmdump", "--mode", "regular", "--listen-host", "0.0.0.0",
+             "--listen-port", "8080", "-q", "-s",
+             str(Path(__file__).with_name("har_addon.py"))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        self._fwd = subprocess.Popen(
+            ["python3", "-m", "damru.sni_proxy", "--listen", "0.0.0.0:8899",
+             "--via", "127.0.0.1:8080", "--log", str(har_path.with_suffix(".flows.jsonl"))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.2)
+        self._container_ip = self._detect_container_ip()
+        if self._container_ip:
+            subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
+                            self._container_ip, "-p", "tcp", "--dport", "443",
+                            "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
+            subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
+                            self._container_ip, "-p", "tcp", "--dport", "80",
+                            "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
+        logger.info("App HAR capture -> %s", har_path)
+
+    async def _stop_capture(self) -> None:
+        if self._container_ip:
+            for port in ("443", "80"):
+                subprocess.run(["iptables", "-t", "nat", "-D", "PREROUTING", "-s",
+                                self._container_ip, "-p", "tcp", "--dport", port,
+                                "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
+        if self._mitm:
+            self._mitm.send_signal(signal.SIGINT)
+            try:
+                self._mitm.wait(timeout=8)
+            except Exception:
+                self._mitm.kill()
+        if self._fwd:
+            self._fwd.terminate()
+        logger.info("App HAR saved -> %s", self.har)
+
+    async def __aenter__(self) -> "StealthAppResult":
+        self._serial_resolved = self.serial
+        if self.har:
+            adb = ADB(self.serial) if self.serial else ADB()
+            await adb.ensure_server()
+            self._serial_resolved = self.serial or await adb.detect_device()
+            await self._start_capture()
+        result = await self.apply()
+        return result
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self.har:
+            try:
+                await self._stop_capture()
+            except Exception as e:
+                logger.warning("HAR stop failed: %s", e)
 
     async def apply(self) -> StealthAppResult:
         adb = ADB(self.serial) if self.serial else ADB()
