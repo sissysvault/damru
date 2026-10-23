@@ -403,7 +403,7 @@ class FrameSession {
         worldName: this._crPage.utilityWorldName
       }),
       this._crPage._networkManager.addSession(this._client, void 0, this._isMainFrame()),
-      this._client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })
+      this._client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: !process.env.PLAYWRIGHT_STEALTH_RUNTIME, flatten: true })
     ];
     if (!this._page.isStorageStatePage) {
       if (this._crPage._browserContext.needsPlaywrightBinding())
@@ -600,11 +600,11 @@ class FrameSession {
       session.on("Inspector.workerScriptLoaded", () => worker.workerScriptLoaded());
     else
       worker.workerScriptLoaded();
-    session._sendMayFail("Runtime.enable");
+    if (!process.env.PLAYWRIGHT_STEALTH_RUNTIME) session._sendMayFail("Runtime.enable"); /* PLAYWRIGHT_STEALTH_WORKER_V1 */
     this._crPage._networkManager.addSession(session, this._page.frameManager.frame(this._targetId) ?? void 0).catch(() => {
     });
     session._sendMayFail("Runtime.runIfWaitingForDebugger");
-    session._sendMayFail("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+    session._sendMayFail("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: !process.env.PLAYWRIGHT_STEALTH_RUNTIME, flatten: true }); /* PLAYWRIGHT_STEALTH_WORKER_V1 */
     session.on("Target.attachedToTarget", (event2) => this._onAttachedToTarget(event2));
     session.on("Target.detachedFromTarget", (event2) => this._onDetachedFromTarget(event2));
     session.on("Runtime.consoleAPICalled", (event2) => {

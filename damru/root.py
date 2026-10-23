@@ -1309,8 +1309,38 @@ echo damru_app_data_dirs_created=$created
         await self.adb.shell_root(
             f'printf "%s" "{cpu_range}" > /data/local/tmp/cpu_online',
         )
+        # Chromium on Android derives CPU count from the /sys/devices/system/cpu
+        # directory listing (cpu0..cpuN), not only sysconf. Bind-mounting just the
+        # `online` file leaves the directory with the host's real cpuN entries, so
+        # Chrome still sees the host core count. Build a synthetic sysfs CPU tree
+        # with cpu0..cpu{target-1} and bind it over the real directory.
         await self.adb.shell_root(
-            "mount --bind /data/local/tmp/cpu_online /sys/devices/system/cpu/online",
+            "B=/data/local/tmp/damru_sys_cpu; "
+            "rm -rf $B; mkdir -p $B; "
+            f"printf '%s\\n' '{cpu_range}' > $B/possible; "
+            f"printf '%s\\n' '{cpu_range}' > $B/present; "
+            f"printf '%s\\n' '{cpu_range}' > $B/online; "
+            "printf '' > $B/offline; "
+            "printf '63\\n' > $B/kernel_max; "
+            f"i=0; while [ $i -lt {target_cores} ]; do "
+            "mkdir -p $B/cpu$i/topology; "
+            "printf '1\\n' > $B/cpu$i/online; "
+            "printf '0\\n' > $B/cpu$i/topology/core_id; "
+            "printf '0\\n' > $B/cpu$i/topology/physical_package_id; "
+            f"printf '%s\\n' '{cpu_range}' > $B/cpu$i/topology/core_siblings; "
+            f"printf '%s\\n' '{cpu_range}' > $B/cpu$i/topology/thread_siblings; "
+            "i=$((i+1)); "
+            "done",
+            timeout=30,
+        )
+        await self.adb.shell_root(
+            "umount /sys/devices/system/cpu 2>/dev/null || true; "
+            "mount --bind /data/local/tmp/damru_sys_cpu /sys/devices/system/cpu",
+            timeout=15,
+        )
+        # Keep the single-file bind for kernels that resolve `online` directly.
+        await self.adb.shell_root(
+            "mount --bind /data/local/tmp/cpu_online /sys/devices/system/cpu/online 2>/dev/null || true",
         )
 
         await self.adb.shell_root(

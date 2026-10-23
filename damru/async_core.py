@@ -1640,6 +1640,30 @@ class AsyncDamru:
         self._context.on("page", _bind_for_page)
         logger.info("Storage quota override: %dGB per origin (CDP)", quota_gb)
 
+    async def _read_worker_native_identity(self, page: Page) -> Optional[dict]:
+        """Read platform/languages from a real Worker realm.
+
+        Workers do not execute add_init_script and cannot be CDP-overridden
+        without enabling worker auto-attach (a detection surface). Mirroring the
+        worker's native values into the page CDP override keeps main and worker
+        consistent, which is what bot detectors compare.
+        """
+        try:
+            return await page.evaluate(
+                """()=>new Promise(r=>{
+                    try{
+                      const c='self.onmessage=()=>postMessage({p:navigator.platform,l:(navigator.languages||[]).slice()});';
+                      const u=URL.createObjectURL(new Blob([c],{type:'application/javascript'}));
+                      const w=new Worker(u);
+                      w.onmessage=e=>r(e.data);
+                      w.postMessage(1);
+                      setTimeout(()=>r(null),3000);
+                    }catch(e){ r(null); }
+                })"""
+            )
+        except Exception:
+            return None
+
     async def _apply_ua_override(
         self, device: AndroidDevice, chrome_version: Optional[str] = None,
         android_version: Optional[str] = None,
@@ -1711,9 +1735,26 @@ class AsyncDamru:
             p.split(";")[0].strip() for p in accept_lang_header.split(",")
         )
 
+        # Mirror the real Worker realm's platform/languages so page and worker
+        # report identical values (detectors flag main/worker divergence).
+        _ident_page = self._context.pages[0] if self._context and self._context.pages else None
+        native_ident = await self._read_worker_native_identity(_ident_page) if _ident_page else None
+        override_platform = "Linux armv8l"
+        if native_ident:
+            wp = (native_ident.get("p") or "").strip()
+            wl = native_ident.get("l") or []
+            if wp:
+                override_platform = wp
+            if wl:
+                accept_lang_tags = ",".join(wl)
+            logger.info(
+                "Worker identity mirror: platform=%s languages=%s",
+                override_platform, accept_lang_tags,
+            )
+
         ua_payload = {
             "userAgent": ua,
-            "platform": "Linux armv8l",
+            "platform": override_platform,
             "acceptLanguage": accept_lang_tags,
             "userAgentMetadata": ua_metadata,
         }

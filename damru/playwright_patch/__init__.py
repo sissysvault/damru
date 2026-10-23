@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # Marker string present in our patched crPage.js -- used for quick detection.
 _PATCH_MARKER = "PLAYWRIGHT_STEALTH_RUNTIME_DAMRU_DYNAMIC_V2"
 _ENV_MARKER = "PLAYWRIGHT_STEALTH_RUNTIME"
+_WORKER_MARKER = "PLAYWRIGHT_STEALTH_WORKER_V1"
 _VALID_RUNTIME_SNIPPET = f"process.env.{_ENV_MARKER} ?"
 _VALID_CONTEXT_SNIPPET = "const frame = contextPayload.auxData ?"
 
@@ -85,6 +86,7 @@ def _is_patched(path: Path) -> bool:
             _PATCH_MARKER in text
             and _VALID_RUNTIME_SNIPPET in text
             and _VALID_CONTEXT_SNIPPET in text
+            and _WORKER_MARKER in text
         )
     except Exception:
         return False
@@ -92,6 +94,20 @@ def _is_patched(path: Path) -> bool:
 
 def _patch_text(source: str) -> str:
     """Patch the installed Playwright file while preserving its version shape."""
+    # Worker-CDP stealth (idempotent): never enable Runtime on worker sessions and
+    # never pause workers for the debugger. Otherwise console.log(Error) in a
+    # worker serializes Error.prepareStackTrace, which detectors use to flag
+    # "CDP automation in web worker".
+    if _WORKER_MARKER not in source:
+        source = source.replace(
+            'session._sendMayFail("Runtime.enable");',
+            'if (!process.env.PLAYWRIGHT_STEALTH_RUNTIME) session._sendMayFail("Runtime.enable"); /* PLAYWRIGHT_STEALTH_WORKER_V1 */')
+        source = source.replace(
+            'this._client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })',
+            'this._client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: !process.env.PLAYWRIGHT_STEALTH_RUNTIME, flatten: true })')
+        source = source.replace(
+            'session._sendMayFail("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });',
+            'session._sendMayFail("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: !process.env.PLAYWRIGHT_STEALTH_RUNTIME, flatten: true }); /* PLAYWRIGHT_STEALTH_WORKER_V1 */')
     # Repair bad patches created by older mojibake-cleanup builds.
     source = source.replace(
         f'process.env.{_ENV_MARKER}  this._client.send',

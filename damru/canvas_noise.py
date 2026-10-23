@@ -110,7 +110,11 @@ def canvas_noise_js(seed: str) -> str:
     const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
     CanvasRenderingContext2D.prototype.getImageData = function(x,y,w,h) {{
       const d = _origGetImageData.call(this,x,y,w,h);
+      // Do not touch fully transparent pixels (alpha==0). Transparency tests
+      // (fpscanner TRANSPARENT_PIXEL) read a 1x1 clear pixel and expect RGBA
+      // 0,0,0,0; perturbing it is a detectable tamper signal.
       for (let i=0;i<d.data.length;i+=4) {{
+        if (d.data[i+3] === 0) continue;
         d.data[i] = Math.min(255, Math.max(0, d.data[i] + (_r*255-12)|0));
       }}
       return d;
