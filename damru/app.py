@@ -90,6 +90,59 @@ class StealthApp:
                 return line.split()[1].split("/")[0]
         return ""
 
+    def _apply_battery_spoof(self, reset_stats: bool = False) -> None:
+        """Present a realistic, clock-driven discharging/charging battery.
+
+        Chrome's navigator.getBattery() reads BatteryService, so this is done
+        at the OS level (no JS). Values come from damru.battery: a deterministic
+        24h cycle (overnight USB charge -> daytime drain), so the level drifts
+        like a real phone instead of static random numbers.
+        Disable with DAMRU_BATTERY_SPOOF=0.
+        """
+        if os.environ.get("DAMRU_BATTERY_SPOOF", "1") == "0":
+            return
+        from .battery import state as battery_state, adb_commands
+        st = battery_state()
+        # the device may be mid-restart after profile/GPU apply: wait and retry
+        for _ in range(5):
+            try:
+                self._sh("wait-for-device", timeout=20)
+                ready = self._sh("shell", "getprop", "sys.boot_completed", timeout=8).strip()
+            except Exception:
+                ready = ""
+            if ready == "1":
+                break
+            time.sleep(3)
+        for attempt in range(3):
+            if reset_stats and attempt == 0:
+                self._sh("shell", "dumpsys batterystats --reset", timeout=15)
+            for c in adb_commands(st):
+                self._sh("shell", c, timeout=10)
+            try:
+                out = self._sh("shell", "dumpsys battery", timeout=10)
+            except Exception:
+                out = ""
+            if ("level: %d" % st["level"]) in out:
+                logger.info("Battery: %d%% %s (%.1f C, %.2f Ah)",
+                            st["level"],
+                            "charging(usb)" if st["charging"] else "discharging",
+                            st["temperature_c"], st["counter_uah"] / 1e6)
+                return
+            time.sleep(4)
+        logger.warning("Battery spoof could not be verified on device")
+
+    async def _battery_keepalive(self) -> None:
+        """Re-apply the clock-derived battery so the level keeps drifting."""
+        try:
+            while True:
+                await asyncio.sleep(120)
+                try:
+                    self._apply_battery_spoof()
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.debug("Battery keepalive failed: %s", exc)
+        except asyncio.CancelledError:
+            pass
+
     def _install_ca(self) -> None:
         cert = Path(os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem"))
         if not cert.exists():
@@ -108,9 +161,25 @@ class StealthApp:
             "chmod 644 /data/local/tmp/cacerts/*; "
             "mount --bind /data/local/tmp/cacerts /apex/com.android.conscrypt/cacerts || true"
         )
-        tmp = Path("/tmp/_damru_ca.sh"); tmp.write_text("#!/system/bin/sh\n" + script + "\n")
-        self._sh("push", str(tmp), "/data/local/tmp/_damru_ca.sh")
-        self._sh("shell", "su", "0", "sh", "/data/local/tmp/_damru_ca.sh")
+        # unique temp file: a fixed /tmp path breaks when a previous run left
+        # it root-owned ("Permission denied: /tmp/_damru_ca.sh")
+        import tempfile
+        cache = Path(os.path.expanduser("~/.cache/damru"))
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            cache = Path(tempfile.gettempdir())
+        fd, tmp_name = tempfile.mkstemp(prefix="damru_ca_", suffix=".sh", dir=str(cache))
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write("#!/system/bin/sh\n" + script + "\n")
+            self._sh("push", tmp_name, "/data/local/tmp/_damru_ca.sh")
+            self._sh("shell", "su", "0", "sh", "/data/local/tmp/_damru_ca.sh")
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
 
     async def _start_capture(self) -> None:
         assert self.har
@@ -120,24 +189,54 @@ class StealthApp:
         env = dict(os.environ, DAMRU_HAR_OUT=str(har_path))
         self._mitm = subprocess.Popen(
             ["mitmdump", "--mode", "regular", "--listen-host", "0.0.0.0",
+             "--set", "http2=false",
              "--listen-port", "8080", "-q", "-s",
              str(Path(__file__).with_name("har_addon.py"))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        await asyncio.sleep(1.2)
+        self._container_ip = self._detect_container_ip()
+        gw = self._host_gateway()
+        # Transparent interception: DNAT container TCP 80/443 into the SNI
+        # forwarder, which relays to mitmproxy. No system proxy is set, so
+        # apps see a clean direct network (no proxy/VPN artifacts) and cold
+        # starts do not stall behind a proxy they must negotiate.
         self._fwd = subprocess.Popen(
             ["python3", "-m", "damru.sni_proxy", "--listen", "0.0.0.0:8899",
              "--via", "127.0.0.1:8080", "--log", str(har_path.with_suffix(".flows.jsonl"))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        await asyncio.sleep(1.2)
-        self._container_ip = self._detect_container_ip()
-        gw = self._host_gateway()
-        # System proxy is the simplest full-coverage egress (Cronet honors it).
-        prev = self._sh("shell", "settings", "get", "global", "http_proxy").strip()
-        self._prev_proxy = prev if prev not in ("", "null", ":0") else ""
-        self._sh("shell", "settings", "put", "global", "http_proxy", f"{gw}:8080")
-        logger.info("App HAR capture -> %s (device proxy %s:8080)", har_path, gw)
+        await asyncio.sleep(1.0)
+        self._sh("shell", "settings", "put", "global", "http_proxy", ":0")
+        # apps may resolve AAAA and reach the web over IPv6, which would
+        # bypass the IPv4-only DNAT rules and vanish from the capture.
+        self._sh("shell", "sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1",
+                 timeout=8)
+        self._sh("shell", "sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=1",
+                 timeout=8)
+        # fresh capture session: truncate the streaming files so the HAR and
+        # the live streams reflect exactly this run, not previous ones
+        for suffix in (".jsonl", ".events.jsonl"):
+            try:
+                open(str(har_path) + suffix, "w").close()
+            except Exception:
+                pass
+        if self._container_ip:
+            for port in ("443", "80"):
+                subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
+                                self._container_ip, "-p", "tcp", "--dport", port,
+                                "-j", "DNAT", "--to-destination", f"172.17.0.1:8899"], check=False)
+            # Cronet apps (Reddit) fetch their APIs over QUIC/HTTP3 (UDP 443),
+            # which bypasses the TCP DNAT entirely and leaves the HAR with
+            # empty bodies. Drop UDP 443 so they fall back to visible TCP.
+            subprocess.run(["iptables", "-I", "FORWARD", "1", "-s",
+                            self._container_ip, "-p", "udp", "--dport", "443",
+                            "-j", "DROP"], check=False)
+        logger.info("App HAR capture -> %s (transparent DNAT -> 8899 -> mitm 8080)", har_path)
 
     async def _stop_capture(self) -> None:
         if self._container_ip:
+            subprocess.run(["iptables", "-D", "FORWARD", "-s",
+                            self._container_ip, "-p", "udp", "--dport", "443",
+                            "-j", "DROP"], check=False)
             for port in ("443", "80"):
                 subprocess.run(["iptables", "-t", "nat", "-D", "PREROUTING", "-s",
                                 self._container_ip, "-p", "tcp", "--dport", port,
@@ -145,14 +244,51 @@ class StealthApp:
         if self._mitm:
             self._mitm.send_signal(signal.SIGINT)
             try:
-                self._mitm.wait(timeout=8)
+                self._mitm.wait(timeout=12)
             except Exception:
-                self._mitm.kill()
+                self._mitm.send_signal(signal.SIGINT)
+                try:
+                    self._mitm.wait(timeout=5)
+                except Exception:
+                    self._mitm.kill()
+                    self._mitm.wait(timeout=5)
         if self._fwd:
             self._fwd.terminate()
-        # restore/clear device proxy
         self._sh("shell", "settings", "put", "global", "http_proxy", self._prev_proxy or ":0")
+        self._repair_har()
         logger.info("App HAR saved -> %s", self.har)
+
+    def _repair_har(self) -> None:
+        """Ensure the HAR file is complete JSON; rebuild it from the addon's
+        streaming .jsonl if mitmdump was killed mid-write."""
+        import json
+        try:
+            with open(self.har, "r", encoding="utf-8") as f:
+                json.load(f)
+            return
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning("HAR truncated at teardown; rebuilding from .jsonl")
+        entries = []
+        try:
+            with open(str(self.har) + ".jsonl", "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        entries.append(json.loads(ln))
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            return
+        if not entries:
+            return
+        with open(self.har, "w", encoding="utf-8") as f:
+            json.dump({"log": {"version": "1.2",
+                               "creator": {"name": "damru-netcap", "version": "1.1"},
+                               "entries": entries}}, f, ensure_ascii=False)
 
     async def __aenter__(self) -> "StealthAppResult":
         self._serial_resolved = self.serial
@@ -168,9 +304,17 @@ class StealthApp:
             await self._start_capture()
             if self.launch:
                 result.activity = await self.launch_app()
+            self._battery_task = asyncio.create_task(self._battery_keepalive())
         return result
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        task = getattr(self, "_battery_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
         if self.har:
             try:
                 await self._stop_capture()
@@ -214,6 +358,9 @@ class StealthApp:
             netcap_preload=self.netcap,
         )
 
+        if self.har:
+            # capture runs: clock-driven, realistic battery state
+            self._apply_battery_spoof(reset_stats=True)
         activity = ""
         if self.har:
             # stop first so every connection is created after the capture proxy

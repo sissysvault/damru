@@ -25,6 +25,24 @@ _TEXTUAL = ("text/", "application/json", "application/javascript", "application/
 MAX_BODY = int(os.environ.get("DAMRU_HAR_MAX_BODY", "2000000"))
 
 
+def _jsonsafe(o):
+    """json.dumps(ensure_ascii=False) raises on lone surrogates, which mitm
+    produces for binary header/cookie bytes (surrogateescape). One poisoned
+    Set-Cookie value silently killed whole entries (except: pass) and
+    truncated the final HAR write. Clean every string before dumping."""
+    if isinstance(o, str):
+        try:
+            o.encode("utf-8")
+            return o
+        except UnicodeEncodeError:
+            return o.encode("utf-8", "replace").decode("utf-8", "replace")
+    if isinstance(o, dict):
+        return {k: _jsonsafe(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_jsonsafe(v) for v in o]
+    return o
+
+
 def _iso(ts):
     if not ts:
         return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z"
@@ -36,13 +54,33 @@ def _headers(msg):
 
 
 def _multi(view):
+    """Cookie/query multi-views. mitm may yield (name, value) tuples, plain
+    strings, or Cookie/CookieAttrs objects; every shape became a str, since
+    a stray CookieAttrs object raised TypeError in json.dumps and killed the
+    whole entry (register/auth flows carry these rich cookies)."""
+    out = []
     try:
-        return [{"name": k, "value": v} for k, v in view.items(multi=True)]
+        items = list(view.items(multi=True))
     except TypeError:
         try:
-            return [{"name": k, "value": v} for k, v in view.items()]
+            items = list(view.items())
         except Exception:
             return []
+    except Exception:
+        return []
+    for it in items:
+        if isinstance(it, tuple) and len(it) == 2:
+            out.append({"name": str(it[0]), "value": str(it[1])})
+        elif isinstance(it, str):
+            out.append({"name": it, "value": ""})
+        else:
+            nm = getattr(it, "name", None)
+            if nm is None:
+                nm = getattr(it, "key", None)
+            vl = getattr(it, "value", None)
+            if nm is not None:
+                out.append({"name": str(nm), "value": str(vl) if vl is not None else ""})
+    return out
 
 
 def _decompress(msg, raw):
@@ -89,13 +127,62 @@ def _body(msg, mime):
 
 
 class HARRecorder:
+    # Live request/response event stream (Playwright-style in-flight
+    # visibility), separate from the HAR entries so the HAR rebuild from
+    # OUT.jsonl stays untouched. Consumers tail this with damru.netstream.
+    def request(self, flow: http.HTTPFlow):
+        self._event("request", flow)
+
     def response(self, flow: http.HTTPFlow):
+        self._event("response", flow)
         self._record(flow)
 
     def error(self, flow: http.HTTPFlow):
+        self._event("error", flow)
         self._record(flow, error=str(flow.error)[:300] if flow.error else "error")
 
+    def _event(self, kind, flow):
+        ev = {"kind": kind, "id": flow.id,
+              "ts": flow.request.timestamp_start or time.time(),
+              "method": flow.request.method, "url": flow.request.pretty_url}
+        if flow.response is not None:
+            ev["status"] = flow.response.status_code
+        elif kind == "error":
+            ev["status"] = 0
+        try:
+            with open(OUT + ".events.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(_jsonsafe(ev), ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
     def _record(self, flow, error=""):
+        try:
+            self._record_opts(flow, error)
+        except Exception as exc:
+            # a malformed view (query strings, cookies, odd content-encoding)
+            # must never lose the whole entry: emit a minimal one and log it
+            entry = {"startedDateTime": _iso(time.time()), "time": 0,
+                     "request": {"method": flow.request.method,
+                                 "url": flow.request.pretty_url,
+                                 "httpVersion": flow.request.http_version or "",
+                                 "headers": [], "queryString": [], "cookies": [],
+                                 "headersSize": -1, "bodySize": 0},
+                     "response": {"status": (flow.response.status_code
+                                             if flow.response is not None else 0),
+                                  "statusText": "", "httpVersion": "",
+                                  "headers": [], "cookies": [],
+                                  "content": {"size": 0, "mimeType": ""},
+                                  "redirectURL": "", "headersSize": -1, "bodySize": 0},
+                     "cache": {}, "timings": {"send": 0, "wait": 0, "receive": 0},
+                     "_record_error": str(exc)[:200]}
+            _entries.append(entry)
+            try:
+                with open(OUT + ".jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(_jsonsafe(entry), ensure_ascii=False, default=str) + "\n")
+            except Exception:
+                pass
+
+    def _record_opts(self, flow, error=""):
         req = flow.request
         resp = flow.response
         rs = req.timestamp_start or time.time()
@@ -155,16 +242,19 @@ class HARRecorder:
         # rebuilt from this file if the process does not shut down cleanly.
         try:
             with open(OUT + ".jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+                f.write(json.dumps(_jsonsafe(entry), ensure_ascii=False, default=str) + "\n")
+        except Exception as _e:
+            with open(OUT + ".jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"_dump_error": str(_e)[:120],
+                                    "url": req.pretty_url}, ensure_ascii=True, default=str) + "\n")
+        
 
     def done(self):
         har = {"log": {"version": "1.2",
                        "creator": {"name": "damru-netcap", "version": "1.1"},
                        "entries": _entries}}
         with open(OUT, "w", encoding="utf-8") as f:
-            json.dump(har, f, ensure_ascii=False)
+            json.dump(_jsonsafe(har), f, ensure_ascii=False, default=str)
         print(f"HAR written: {OUT} ({len(_entries)} entries)", flush=True)
 
 
