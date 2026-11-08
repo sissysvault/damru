@@ -188,8 +188,9 @@ def _build_chrome_flags(
         "--js-flags=--max-old-space-size=1024",
         # Expose fake media devices so enumerateDevices includes videoinput.
         "--use-fake-device-for-media-stream",
-        # Avoid Redroid BatteryService test-mode instability and 100%-charging tells.
-        "--disable-battery-status-api",
+        # Battery Status API is intentionally ENABLED: real Chrome Android has
+        # navigator.getBattery(), and damru now feeds BatteryService a realistic
+        # clock-driven state (damru/battery.py), so the API reports true values.
         # Keep SpeechSynthesis path enabled on Android builds that gate it.
         "--enable-speech-synthesis-api",
         # Enable Web APIs that real Chrome Android exposes.
@@ -232,7 +233,6 @@ def _build_chrome_flags(
     # NOTE: WebRtcHideLocalIpsWithMdns must stay ENABLED (do NOT disable it).
     # Real Android Chrome hides local IPs behind mDNS ".local" host candidates.
     disabled_features = [
-        "BatteryStatus",
         "PaintHolding",
         # Automation tells
         "Translate",
