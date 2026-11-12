@@ -303,6 +303,7 @@ def main(argv=None) -> int:
     ap.add_argument("--upstream", default="direct", help="socks5://user:pass@host:port | http://... | direct")
     ap.add_argument("--log", default="flows.jsonl")
     ap.add_argument("--via", default="", help="host:port of a downstream HTTP proxy (e.g. mitmproxy) to chain through")
+    ap.add_argument("--allow-src", default="", help="comma-separated source IPs allowed to connect (default: any)")
     args = ap.parse_args(argv)
 
     global VIA
@@ -319,8 +320,18 @@ def main(argv=None) -> int:
     log = Logger(args.log)
 
     async def run():
-        server = await asyncio.start_server(
-            lambda r, w: handle(r, w, upstream, log), lh, int(lp))
+        allowed = {a.strip() for a in args.allow_src.split(",") if a.strip()}
+
+        async def gate(r, w):
+            # Reject other containers: a stale/foreign DNAT rule must never
+            # mix their traffic into this capture.
+            peer = w.get_extra_info("peername") or ("",)
+            if allowed and peer[0] not in allowed:
+                w.close()
+                return
+            await handle(r, w, upstream, log)
+
+        server = await asyncio.start_server(gate, lh, int(lp))
         print(f"SNI proxy on {lh}:{lp} -> {upstream['scheme']} {upstream['host']}:{upstream['port']}", flush=True)
         async with server:
             await server.serve_forever()

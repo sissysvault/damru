@@ -16,12 +16,32 @@ import base64
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from .adb import ADB
 from .profile_apply import AppliedDeviceProfile, force_device_profile
 from .utils import logger
+
+
+def _free_port(host: str) -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def _purge_capture_rules(ip: str) -> None:
+    """Delete every capture DNAT / UDP-443 drop rule for this source IP."""
+    src = f"-s {ip}/32 "
+    for table, chain, match in (("nat", "PREROUTING", "-j DNAT"),
+                                ("filter", "FORWARD", "--dport 443 -j DROP")):
+        out = subprocess.run(["iptables", "-w", "-t", table, "-S", chain],
+                             capture_output=True, text=True).stdout
+        for rule in out.splitlines():
+            if rule.startswith(f"-A {chain} ") and src in rule + " " and match in rule:
+                subprocess.run(["iptables", "-w", "-t", table, "-D", *rule.split()[1:]], check=False)
 
 
 @dataclass
@@ -66,6 +86,8 @@ class StealthApp:
         self._fwd: Optional[subprocess.Popen] = None
         self._serial_resolved: Optional[str] = None
         self._container_ip: str = ""
+        self._mitm_port: int = 0
+        self._fwd_port: int = 0
         self._prev_proxy: str = ""
         self._rules: list[str] = []
 
@@ -187,11 +209,28 @@ class StealthApp:
         har_path.parent.mkdir(parents=True, exist_ok=True)
         self._install_ca()
         env = dict(os.environ, DAMRU_HAR_OUT=str(har_path))
+        upstream = env.get("DAMRU_MITM_UPSTREAM", "").strip()
+        upstream_auth = env.get("DAMRU_MITM_UPSTREAM_AUTH", "").strip()
+        self._mitm_port = _free_port("127.0.0.1")
+        self._fwd_port = _free_port("0.0.0.0")
+        mitm_cmd = ["mitmdump"]
+        if upstream:
+            mitm_cmd.extend(["--mode", f"upstream:{upstream}"])
+            if upstream_auth:
+                mitm_cmd.extend(["--upstream-auth", upstream_auth])
+        elif self.proxy:
+            raise RuntimeError("DAMRU_MITM_UPSTREAM is required when capture uses an account proxy")
+        else:
+            mitm_cmd.extend(["--mode", "regular"])
+        mitm_cmd.extend([
+            # Per-session loopback port: concurrent captures on other
+            # containers must never share (or reach) this mitm.
+            "--listen-host", "127.0.0.1", "--set", "http2=false",
+            "--listen-port", str(self._mitm_port), "-q", "-s",
+            str(Path(__file__).with_name("har_addon.py")),
+        ])
         self._mitm = subprocess.Popen(
-            ["mitmdump", "--mode", "regular", "--listen-host", "0.0.0.0",
-             "--set", "http2=false",
-             "--listen-port", "8080", "-q", "-s",
-             str(Path(__file__).with_name("har_addon.py"))],
+            mitm_cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         await asyncio.sleep(1.2)
         self._container_ip = self._detect_container_ip()
@@ -201,10 +240,17 @@ class StealthApp:
         # apps see a clean direct network (no proxy/VPN artifacts) and cold
         # starts do not stall behind a proxy they must negotiate.
         self._fwd = subprocess.Popen(
-            ["python3", "-m", "damru.sni_proxy", "--listen", "0.0.0.0:8899",
-             "--via", "127.0.0.1:8080", "--log", str(har_path.with_suffix(".flows.jsonl"))],
+            # same interpreter as damru; plain "python3" may not have damru installed
+            [sys.executable, "-m", "damru.sni_proxy", "--listen", f"0.0.0.0:{self._fwd_port}",
+             "--via", f"127.0.0.1:{self._mitm_port}",
+             # only this container's traffic may enter this capture
+             "--allow-src", self._container_ip or "none",
+             "--log", str(har_path.with_suffix(".flows.jsonl"))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(1.0)
+        if self._mitm.poll() is not None or self._fwd.poll() is not None:
+            raise RuntimeError(
+                f"capture proxy failed to start (mitm port {self._mitm_port}, fwd port {self._fwd_port})")
         self._sh("shell", "settings", "put", "global", "http_proxy", ":0")
         # apps may resolve AAAA and reach the web over IPv6, which would
         # bypass the IPv4-only DNAT rules and vanish from the capture.
@@ -220,27 +266,25 @@ class StealthApp:
             except Exception:
                 pass
         if self._container_ip:
+            # Drop rules a killed earlier session left for this IP (they would
+            # route this container's traffic into another session's capture).
+            _purge_capture_rules(self._container_ip)
             for port in ("443", "80"):
-                subprocess.run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s",
+                subprocess.run(["iptables", "-w", "-t", "nat", "-I", "PREROUTING", "1", "-s",
                                 self._container_ip, "-p", "tcp", "--dport", port,
-                                "-j", "DNAT", "--to-destination", f"172.17.0.1:8899"], check=False)
+                                "-j", "DNAT", "--to-destination", f"172.17.0.1:{self._fwd_port}"], check=False)
             # Cronet apps (Reddit) fetch their APIs over QUIC/HTTP3 (UDP 443),
             # which bypasses the TCP DNAT entirely and leaves the HAR with
             # empty bodies. Drop UDP 443 so they fall back to visible TCP.
-            subprocess.run(["iptables", "-I", "FORWARD", "1", "-s",
+            subprocess.run(["iptables", "-w", "-I", "FORWARD", "1", "-s",
                             self._container_ip, "-p", "udp", "--dport", "443",
                             "-j", "DROP"], check=False)
-        logger.info("App HAR capture -> %s (transparent DNAT -> 8899 -> mitm 8080)", har_path)
+        logger.info("App HAR capture -> %s (src %s DNAT -> %s -> mitm %s)", har_path,
+                    self._container_ip, self._fwd_port, self._mitm_port)
 
     async def _stop_capture(self) -> None:
         if self._container_ip:
-            subprocess.run(["iptables", "-D", "FORWARD", "-s",
-                            self._container_ip, "-p", "udp", "--dport", "443",
-                            "-j", "DROP"], check=False)
-            for port in ("443", "80"):
-                subprocess.run(["iptables", "-t", "nat", "-D", "PREROUTING", "-s",
-                                self._container_ip, "-p", "tcp", "--dport", port,
-                                "-j", "DNAT", "--to-destination", "172.17.0.1:8899"], check=False)
+            _purge_capture_rules(self._container_ip)
         if self._mitm:
             self._mitm.send_signal(signal.SIGINT)
             try:
