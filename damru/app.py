@@ -105,12 +105,18 @@ class StealthApp:
                 return line.split()[2]
         return "172.17.0.1"
 
-    def _detect_container_ip(self) -> str:
-        for line in self._sh("shell", "ip", "-4", "addr", "show").splitlines():
-            line = line.strip()
-            if line.startswith("inet ") and "127.0.0.1" not in line:
-                return line.split()[1].split("/")[0]
-        return ""
+    def _detect_container_ip(self, timeout: float = 20.0) -> str:
+        # Right after a framework restart adb can answer empty; retry rather
+        # than silently skipping the DNAT (the app would then bypass capture).
+        deadline = time.time() + timeout
+        while True:
+            for line in self._sh("shell", "ip", "-4", "addr", "show").splitlines():
+                line = line.strip()
+                if line.startswith("inet ") and "127.0.0.1" not in line:
+                    return line.split()[1].split("/")[0]
+            if time.time() >= deadline:
+                return ""
+            time.sleep(1)
 
     def _apply_battery_spoof(self, reset_stats: bool = False) -> None:
         """Present a realistic, clock-driven discharging/charging battery.
@@ -234,6 +240,9 @@ class StealthApp:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         await asyncio.sleep(1.2)
         self._container_ip = self._detect_container_ip()
+        if not self._container_ip:
+            raise RuntimeError("capture: could not detect the container IP; "
+                               "refusing to run with no traffic redirect")
         gw = self._host_gateway()
         # Transparent interception: DNAT container TCP 80/443 into the SNI
         # forwarder, which relays to mitmproxy. No system proxy is set, so
