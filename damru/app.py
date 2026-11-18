@@ -84,6 +84,8 @@ class StealthApp:
         self.netcap = netcap
         self._mitm: Optional[subprocess.Popen] = None
         self._fwd: Optional[subprocess.Popen] = None
+        self._dns_fwd: Optional[subprocess.Popen] = None
+        self._dns_port: int = 0
         self._serial_resolved: Optional[str] = None
         self._container_ip: str = ""
         self._mitm_port: int = 0
@@ -288,6 +290,36 @@ class StealthApp:
             subprocess.run(["iptables", "-w", "-I", "FORWARD", "1", "-s",
                             self._container_ip, "-p", "udp", "--dport", "443",
                             "-j", "DROP"], check=False)
+            # DNS leaks: Android's netd uses the DNS servers it was handed at
+            # boot (1.1.1.1 / 8.8.8.8 from androidboot.redroid_net_dns*) and
+            # sends queries straight from the host IP, which gives away the
+            # real geo even when HTTPS goes through the account proxy. Route
+            # DNS through a DoH forwarder that tunnels queries via the SAME
+            # upstream proxy so both exit from the same IP/geo.
+            if self.proxy:
+                self._dns_port = _free_port("0.0.0.0")
+                self._dns_fwd = subprocess.Popen(
+                    [sys.executable, "-u",
+                     "/opt/damru-stealth100/damru/dns_doh_forwarder.py",
+                     "--listen", f"0.0.0.0:{self._dns_port}",
+                     "--proxy", self.proxy],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.4)
+                if self._dns_fwd.poll() is None:
+                    for proto in ("udp", "tcp"):
+                        subprocess.run([
+                            "iptables", "-w", "-t", "nat", "-I", "PREROUTING", "1",
+                            "-s", self._container_ip, "-p", proto,
+                            "--dport", "53",
+                            "-j", "DNAT",
+                            "--to-destination", f"172.17.0.1:{self._dns_port}",
+                        ], check=False)
+                    logger.info("DNS DoH forwarder up (port %s -> %s)",
+                                self._dns_port, self.proxy.split("@")[-1])
+                else:
+                    logger.warning("DNS DoH forwarder failed to start; DNS will leak direct")
+                    self._dns_fwd = None
         logger.info("App HAR capture -> %s (src %s DNAT -> %s -> mitm %s)", har_path,
                     self._container_ip, self._fwd_port, self._mitm_port)
 
@@ -305,6 +337,16 @@ class StealthApp:
                 except Exception:
                     self._mitm.kill()
                     self._mitm.wait(timeout=5)
+        if self._dns_fwd:
+            try:
+                self._dns_fwd.terminate()
+                try:
+                    self._dns_fwd.wait(timeout=3)
+                except Exception:
+                    self._dns_fwd.kill()
+            except Exception:
+                pass
+            self._dns_fwd = None
         if self._fwd:
             self._fwd.terminate()
         self._sh("shell", "settings", "put", "global", "http_proxy", self._prev_proxy or ":0")

@@ -65,9 +65,17 @@ def state(now: float | None = None) -> dict:
 
 
 def adb_commands(st: dict) -> list[str]:
-    """dumpsys battery commands for the modelled state (fields Android accepts)."""
+    """dumpsys battery commands for the modelled state (fields Android accepts).
+
+    Command order matters: Android's PowerManager watches for critical battery
+    conditions and will trigger 'shutdown,battery' if `present=true` arrives
+    while level=0/voltage=0/status=1 are still the raw defaults. So set all
+    safe values first, then present=1 last.
+    """
     return [
-        "dumpsys battery set -f present %d" % st["present"],
+        # Enter test mode so real battery monitoring stops interfering.
+        "dumpsys battery unplug",
+        # Set sane values FIRST, before declaring battery present.
         "dumpsys battery set -f level %d" % st["level"],
         "dumpsys battery set -f status %d" % st["status"],
         "dumpsys battery set -f health %d" % st["health"],
@@ -76,4 +84,6 @@ def adb_commands(st: dict) -> list[str]:
         "dumpsys battery set -f wireless %d" % st["wireless"],
         "dumpsys battery set -f temp %d" % st["temp_tenths"],
         "dumpsys battery set -f counter %d" % st["counter_uah"],
+        # present=1 last — now the battery looks fully healthy.
+        "dumpsys battery set -f present %d" % st["present"],
     ]

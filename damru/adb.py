@@ -173,7 +173,22 @@ class ADB:
                 await _exec(ADB()._build_cmd(["connect", self.serial]), reconnect_timeout)
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            # Wait for the device to actually come back online. 0.3s is far too short
+            # when /proc bind-mounts briefly disconnect adbd: poll for up to 20s.
+            for _ in range(20):
+                await asyncio.sleep(1.0)
+                try:
+                    probe_rc, probe_out, _ = await _exec(
+                        ADB()._build_cmd(["-s", self.serial, "get-state"]), 5.0,
+                    )
+                    if probe_rc == 0 and "device" in probe_out.lower():
+                        break
+                except Exception:
+                    pass
+                try:
+                    await _exec(ADB()._build_cmd(["connect", self.serial]), reconnect_timeout)
+                except Exception:
+                    pass
 
             try:
                 rc2, out2, err2 = await _exec(cmd, timeout)

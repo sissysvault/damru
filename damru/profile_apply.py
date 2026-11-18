@@ -243,6 +243,9 @@ async def force_device_profile(
 
     identity_seed = (slot_identity_seed or os.environ.get("DAMRU_SLOT_IDENTITY_SEED") or "").strip()
     identity_spoof_disabled = _env_truthy("DAMRU_DISABLE_SLOT_IDENTITY_SPOOF")
+    if not identity_seed and not identity_spoof_disabled:
+        identity_seed = await _auto_identity_seed(adb, serial)
+        logger.info("Auto-derived slot identity seed from container environment")
     if identity_seed:
         if identity_spoof_disabled:
             logger.info("Slot native identity repair disabled by DAMRU_DISABLE_SLOT_IDENTITY_SPOOF")
@@ -251,6 +254,27 @@ async def force_device_profile(
                 await root.apply_slot_identity_spoof(identity_seed, device=device)
             except Exception as exc:
                 logger.warning("Slot native identity repair skipped: %s", exc)
+
+    if not _env_truthy("DAMRU_DISABLE_BATTERY_SPOOF"):
+        try:
+            from .battery import state as battery_state, adb_commands as battery_cmds
+            script = "; ".join(battery_cmds(battery_state()))
+            await adb.shell(script, allow_failure=True, timeout=15)
+        except Exception as exc:
+            logger.warning("Battery spoof skipped: %s", exc)
+
+    # Fonts and audio: both apply once at container setup, but the markers can
+    # go missing if the container was recreated without setup. Both methods are
+    # idempotent (noop when the marker is present), so running them here closes
+    # the gap on cold containers at near-zero cost on warm ones.
+    try:
+        await root.install_extra_fonts()
+    except Exception as exc:
+        logger.warning("Font install verify skipped: %s", exc)
+    try:
+        await root.apply_audio_48khz()
+    except Exception as exc:
+        logger.warning("Audio spoof verify skipped: %s", exc)
 
     if apply_gpu:
         await root.apply_gpu_binary_spoof(device)
@@ -398,6 +422,18 @@ async def force_device_profile(
         chrome_version=chrome_version,
         chrome_note=chrome_note,
     )
+
+
+
+async def _auto_identity_seed(adb, serial: str) -> str:
+    """Derive a stable per-container identity seed when none is configured."""
+    mac = (await adb.shell("cat /sys/class/net/eth0/address", timeout=5, allow_failure=True)).strip()
+    if mac and mac != "00:00:00:00:00:00" and len(mac) == 17:
+        return f"auto-mac:{mac}"
+    hostname = (await adb.shell("getprop net.hostname", timeout=5, allow_failure=True)).strip()
+    if not hostname:
+        hostname = (await adb.shell("hostname", timeout=5, allow_failure=True)).strip()
+    return f"auto-host:{hostname}:{serial}"
 
 
 async def _noop() -> None:
